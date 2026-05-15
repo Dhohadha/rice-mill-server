@@ -46,6 +46,9 @@ app.use(express.json());
 // Mount Routes
 app.use('/api/users', userRoutes);
 
+// Root Health Check
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Rice Mill Server is running' }));
+
 // Socket.io Connection Logic
 io.on('connection', (socket) => {
   console.log('🔌 New client connected via WebSocket:', socket.id);
@@ -796,7 +799,7 @@ app.get('/api/users/profile', verifyToken, async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
   console.log(`🚀 Rice Mill Server v2.1 (EMS1) listening on port ${PORT}`);
 });

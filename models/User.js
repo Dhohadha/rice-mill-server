@@ -12,6 +12,8 @@ const userSchema = new mongoose.Schema({
   isSharedUser: { type: Boolean, default: false },
   mainUserEmail: { type: String }, // Who gave them access
   sharedWith: [{ type: String }], // Emails of people they shared with
+  accessRevoked: { type: Boolean, default: false }, // Set when owner removes access
+  revokedBy: { type: String }, // Email of the owner who revoked access
   pendingInvitations: [{
     ownerEmail: String,
     ownerName: String,

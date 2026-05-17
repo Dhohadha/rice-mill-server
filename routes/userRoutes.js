@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
+const DeviceToken = require('../models/DeviceToken');
+const admin = require('firebase-admin');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
 
 // Register or get user profile (called after Firebase login)
@@ -41,6 +43,14 @@ router.post('/sync', verifyToken, async (req, res) => {
         await user.save();
       }
     }
+
+    // If revoked user now has pending invitations from a new owner, clear the revoked flag
+    // so they can see and accept the invite instead of being stuck on the revoked screen
+    if (user.accessRevoked && user.pendingInvitations && user.pendingInvitations.length > 0) {
+      user.accessRevoked = false;
+      user.revokedBy = null;
+      await user.save();
+    }
     
     res.json({ ...user.toObject(), isRegistered: true });
   } catch (err) {
@@ -48,6 +58,17 @@ router.post('/sync', verifyToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Helper to get hierarchical user data
+async function getHierarchicalUser(email) {
+  const user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) return null;
+  const userObj = user.toObject();
+  if (!user.isSharedUser) {
+    userObj.subUsers = await User.find({ mainUserEmail: user.email });
+  }
+  return userObj;
+}
 
 // Admin Route: Register a new user
 router.post('/register', async (req, res) => {
@@ -57,36 +78,46 @@ router.post('/register', async (req, res) => {
     
     let user = await User.findOne({ email: normalizedEmail });
     if (user) {
-      user.name = name;
-      user.phone = phone;
-      user.role = 'User'; // Upgrade Guest to User if Admin registers them
-      if (millName) user.millName = millName;
-      if (deviceId && !user.assignedDevices.includes(deviceId)) {
-        user.assignedDevices.push(deviceId);
-      }
-    } else {
-      user = new User({
-        uid: normalizedEmail, // Temporary UID
-        name,
-        phone,
-        email: normalizedEmail,
-        role: 'User',
-        millName: millName || 'Rice Mill',
-        assignedDevices: deviceId ? [deviceId] : []
-      });
+      return res.status(400).json({ message: 'A user with this email already exists in the system.' });
     }
+
+    user = new User({
+      uid: normalizedEmail, // Temporary UID until they sign in
+      name,
+      phone,
+      email: normalizedEmail,
+      role: 'User',
+      millName: millName || 'Rice Mill',
+      assignedDevices: deviceId ? [deviceId] : []
+    });
     await user.save();
-    res.status(201).json({ message: 'User registered successfully', user });
+    
+    const updatedUser = await getHierarchicalUser(normalizedEmail);
+    res.status(201).json({ message: 'User registered successfully', user: updatedUser });
   } catch (error) {
     res.status(500).json({ message: 'Error registering user' });
   }
 });
 
-// Admin Route: Get all users
+// Admin Route: Get hierarchical user data (Owners and their Shared Users)
 router.get('/', async (req, res) => {
   try {
-    const users = await User.find();
-    res.json(users);
+    // 1. Fetch all users
+    const allUsers = await User.find();
+    
+    // 2. Separate into Owners and Shared Users
+    // An owner is anyone who is NOT a shared user and has at least one device (or is an Admin)
+    const owners = allUsers.filter(u => !u.isSharedUser && u.role !== 'Guest');
+    const sharedUsers = allUsers.filter(u => u.isSharedUser);
+
+    // 3. Nest Shared Users under their respective Owners
+    const hierarchicalData = owners.map(owner => {
+      const ownerObj = owner.toObject();
+      ownerObj.subUsers = sharedUsers.filter(u => u.mainUserEmail === owner.email);
+      return ownerObj;
+    });
+
+    res.json(hierarchicalData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -104,7 +135,8 @@ router.post('/:email/devices', async (req, res) => {
       user.assignedDevices.push(deviceId);
       await user.save();
     }
-    res.json({ message: 'Device added successfully', user });
+    const updatedUser = await getHierarchicalUser(email);
+    res.json({ message: 'Device added successfully', user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -119,7 +151,8 @@ router.delete('/:email/devices/:deviceId', async (req, res) => {
 
     user.assignedDevices = user.assignedDevices.filter(id => id !== deviceId);
     await user.save();
-    res.json({ message: 'Device removed successfully', user });
+    const updatedUser = await getHierarchicalUser(email);
+    res.json({ message: 'Device removed successfully', user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -157,7 +190,8 @@ router.post('/:email/share', async (req, res) => {
       owner.sharedWith.push(sharedEmail.toLowerCase());
       await owner.save();
     }
-    res.json({ message: 'Access shared successfully', sharedUser });
+    const updatedOwner = await getHierarchicalUser(email);
+    res.json({ message: 'Access shared successfully', sharedUser, owner: updatedOwner });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -188,7 +222,8 @@ router.delete('/:email/share/:sharedEmail', async (req, res) => {
     owner.sharedWith = owner.sharedWith.filter(e => e !== sharedEmail.toLowerCase());
     await owner.save();
 
-    res.json({ message: 'Access revoked successfully', owner });
+    const updatedOwner = await getHierarchicalUser(email);
+    res.json({ message: 'Access revoked successfully', owner: updatedOwner });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -244,7 +279,99 @@ router.put('/:email', async (req, res) => {
     }
 
     await user.save();
-    res.json({ message: 'User updated successfully', user });
+    const updatedUser = await getHierarchicalUser(user.email);
+    res.json({ message: 'User updated successfully', user: updatedUser });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Owner: Revoke shared access from a user
+router.delete('/revoke-access/:sharedEmail', verifyToken, async (req, res) => {
+  try {
+    const owner = await User.findOne({ uid: req.user.uid });
+    if (!owner) return res.status(404).json({ error: 'Owner not found' });
+
+    const sharedEmail = req.params.sharedEmail.toLowerCase();
+
+    // Remove from owner's sharedWith list
+    owner.sharedWith = owner.sharedWith.filter(e => e !== sharedEmail);
+    await owner.save();
+
+    // Update the shared user: remove devices assigned by this owner & mark as revoked
+    const sharedUser = await User.findOne({ email: sharedEmail });
+    if (sharedUser) {
+      // Remove the devices that were shared by this owner
+      // We remove all devices if mainUserEmail matches, otherwise just flag it
+      if (sharedUser.mainUserEmail === owner.email) {
+        sharedUser.assignedDevices = sharedUser.assignedDevices.filter(d => !owner.assignedDevices.includes(d));
+        sharedUser.isSharedUser = false;
+        sharedUser.mainUserEmail = null;
+        sharedUser.role = 'Guest';
+      }
+      sharedUser.accessRevoked = true;
+      sharedUser.revokedBy = owner.email;
+      await sharedUser.save();
+    }
+
+    res.json({ message: 'Access revoked successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verify email before sharing (pre-flight check)
+router.post('/verify-email', verifyToken, async (req, res) => {
+  try {
+    const { emailToShare } = req.body;
+    const owner = await User.findOne({ uid: req.user.uid });
+
+    if (!owner) return res.status(404).json({ error: 'Owner not found' });
+
+    // Shared users cannot share access with others
+    if (owner.isSharedUser) {
+      return res.json({ status: 'no_permission', message: 'Shared users cannot share access with others.' });
+    }
+
+    const normalizedEmail = emailToShare.toLowerCase().trim();
+
+    // 1. Cannot share with yourself
+    if (normalizedEmail === owner.email) {
+      return res.json({ status: 'self', message: 'You cannot share access with yourself.' });
+    }
+
+    // 2. Already in your sharedWith list
+    const alreadySharedByYou = owner.sharedWith.includes(normalizedEmail);
+    if (alreadySharedByYou) {
+      return res.json({ status: 'already_shared', message: 'You have already shared access with this email.' });
+    }
+
+    // 3. Check if the target user exists in the system at all
+    const targetUser = await User.findOne({ email: normalizedEmail });
+
+    if (!targetUser) {
+      // Does not exist yet — they will be created as a placeholder. This is safe.
+      return res.json({ status: 'new_user', message: 'This user is not registered yet. They will receive the invite when they sign in.', name: null });
+    }
+
+    // Block sharing with another owner (someone who has devices and is not a shared user)
+    if (targetUser.assignedDevices && targetUser.assignedDevices.length > 0 && !targetUser.isSharedUser) {
+      return res.json({ status: 'is_owner', message: 'You cannot share access with another owner.' });
+    }
+
+    // 4. Check if the target user is shared by another owner (already has a mainUserEmail that is not this owner)
+    const sharedByOtherOwner = targetUser.isSharedUser && targetUser.mainUserEmail && targetUser.mainUserEmail !== owner.email;
+
+    return res.json({
+      status: 'ok',
+      name: targetUser.name,
+      role: targetUser.role,
+      sharedByOtherOwner,
+      otherOwnerEmail: sharedByOtherOwner ? targetUser.mainUserEmail : null,
+      message: sharedByOtherOwner
+        ? `This user is already managed by ${targetUser.mainUserEmail}. They can still receive your invite.`
+        : `User found: ${targetUser.name}.`
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -257,6 +384,9 @@ router.post('/share', verifyToken, async (req, res) => {
     const owner = await User.findOne({ uid: req.user.uid });
     
     if (!owner) return res.status(404).json({ error: 'Owner not found' });
+    if (owner.isSharedUser) {
+      return res.status(403).json({ error: 'Shared users are not allowed to share access with others.' });
+    }
     if (!owner.assignedDevices || owner.assignedDevices.length === 0) {
       return res.status(400).json({ error: 'No devices to share' });
     }
@@ -272,6 +402,13 @@ router.post('/share', verifyToken, async (req, res) => {
       return res.status(403).json({ error: 'You do not have access to some of these devices' });
     }
 
+    let recipient = await User.findOne({ email: emailToShare.toLowerCase() });
+    
+    // Block sharing with another owner
+    if (recipient && recipient.assignedDevices && recipient.assignedDevices.length > 0 && !recipient.isSharedUser) {
+      return res.status(403).json({ error: 'You cannot share access with another owner.' });
+    }
+
     // Create invitation instead of immediate assignment
     const invitation = {
       ownerEmail: owner.email,
@@ -280,8 +417,11 @@ router.post('/share', verifyToken, async (req, res) => {
       devices: devicesToShare
     };
 
-    let recipient = await User.findOne({ email: emailToShare.toLowerCase() });
     if (recipient) {
+      // Clear revoked flag so they can see the invitation
+      recipient.accessRevoked = false;
+      recipient.revokedBy = null;
+      
       recipient.pendingInvitations.push(invitation);
       await recipient.save();
     } else {
@@ -300,6 +440,25 @@ router.post('/share', verifyToken, async (req, res) => {
       owner.sharedWith.push(emailToShare.toLowerCase());
       await owner.save();
     }
+
+    // Send FCM notification to recipient
+    try {
+      const tokens = await DeviceToken.find({ userEmail: emailToShare.toLowerCase() });
+      if (tokens && tokens.length > 0) {
+        const message = {
+          data: {
+            title: 'New Device Access Invite',
+            body: `${owner.name || owner.email} wants to share device access with you.`,
+            alertId: 'INVITE'
+          },
+          tokens: tokens.map(t => t.token)
+        };
+        await admin.messaging().sendEachForMulticast(message);
+      }
+    } catch (err) {
+      console.error('Error sending invite notification:', err);
+    }
+
     res.json({ message: 'Invitation sent successfully', status: 'pending' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -330,6 +489,10 @@ router.post('/invitations/accept', verifyToken, async (req, res) => {
       user.role = 'User';
       user.millName = invite.millName;
     }
+
+    // Clear any previously revoked access flag since user has now accepted a new invite
+    user.accessRevoked = false;
+    user.revokedBy = null;
 
     // Remove invite
     user.pendingInvitations = user.pendingInvitations.filter(i => i.ownerEmail !== ownerEmail);
@@ -379,48 +542,6 @@ router.get('/:email/shared-details', verifyToken, async (req, res) => {
 });
 
 
-// Guest Route: Add device by ID
-router.post('/add-guest-device', verifyToken, async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'Device ID is required' });
 
-    const user = await User.findOne({ uid: req.user.uid });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    if (user.role !== 'Guest') {
-      return res.status(403).json({ error: 'Only Guest users can manually add devices' });
-    }
-
-    if (!user.assignedDevices.includes(deviceId)) {
-      user.assignedDevices.push(deviceId);
-      await user.save();
-    }
-
-    res.json({ success: true, user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Guest Route: Remove device by ID
-router.delete('/remove-guest-device/:deviceId', verifyToken, async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const user = await User.findOne({ uid: req.user.uid });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    if (user.role !== 'Guest') {
-      return res.status(403).json({ error: 'Only Guest users can manually remove devices' });
-    }
-
-    user.assignedDevices = user.assignedDevices.filter(id => id !== deviceId);
-    await user.save();
-
-    res.json({ success: true, user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 module.exports = router;

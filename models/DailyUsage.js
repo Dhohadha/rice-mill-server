@@ -4,6 +4,19 @@ const dailyUsageSchema = new mongoose.Schema({
   date: { type: Date, required: true }, // Set to the start of the day (00:00:00)
   deviceId: { type: String, required: true },
   totalKWh: { type: Number, required: true, default: 0 },
+  
+  maxKVA: { type: Number, default: 0 },
+  maxKVATime: { type: Date },
+  minKVA: { type: Number, default: 0 },
+  minKVATime: { type: Date },
+  
+  maxKW: { type: Number, default: 0 },
+  maxKWTime: { type: Date },
+  minKW: { type: Number, default: 0 },
+  minKWTime: { type: Date },
+  
+  avgPF: { type: Number, default: 0 },
+  
   createdAt: { type: Date, default: Date.now }
 });
 

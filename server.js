@@ -101,7 +101,7 @@ mqttClient.on('connect', () => {
 
 // Throttle control for saving data (per device)
 const lastSaveTimes = new Map();
-const SAVE_INTERVAL = 60 * 1000; // 1 minute
+const SAVE_INTERVAL = 60 * 700; // 1 minute
 
 // Consecutive breach counters to prevent transient spikes
 // Key structure: `${userEmail}_${deviceId}_${alertType}`
@@ -198,10 +198,10 @@ mqttClient.on('message', async (topic, message) => {
           
           if (alertCheck.isBreached) {
             consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
-            console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/10`);
+            console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
             
-            // Trigger alert on exactly the 10th consecutive breach
-            if (consecutiveBreachCounts[key] === 10) {
+            // Trigger alert on exactly the 7th consecutive breach
+            if (consecutiveBreachCounts[key] === 7) {
               alerts.push({ type: alertCheck.type, msg: alertCheck.msg });
             }
           } else {
@@ -218,7 +218,7 @@ mqttClient.on('message', async (topic, message) => {
           const recentAlert = await Notification.findOne({
             type: alert.type,
             userEmail: user.email, // We should add userEmail to Notification model too
-            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
+            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 700) }
           });
           
           if (!recentAlert) {
@@ -375,9 +375,9 @@ async function calculateHistoricalDayStats(deviceId, date) {
       _id: null,
       avgPF: { $avg: "$PF" },
       maxKVA: { $max: "$KVA" },
-      minKVA: { $min: { $cond: [{ $gt: ["$KVA", 0] }, "$KVA", 1000000] } },
+      minKVA: { $min: { $cond: [{ $gt: ["$KVA", 0] }, "$KVA", 700000] } },
       maxKW: { $max: "$KW" },
-      minKW: { $min: { $cond: [{ $gt: ["$KW", 0] }, "$KW", 1000000] } },
+      minKW: { $min: { $cond: [{ $gt: ["$KW", 0] }, "$KW", 700000] } },
     }}
   ]);
 
@@ -387,8 +387,8 @@ async function calculateHistoricalDayStats(deviceId, date) {
   }
 
   const s = stats[0];
-  if (s.minKVA === 1000000) s.minKVA = 0;
-  if (s.minKW === 1000000) s.minKW = 0;
+  if (s.minKVA === 700000) s.minKVA = 0;
+  if (s.minKW === 700000) s.minKW = 0;
 
   // 2. Exact Timestamps for Extremes
   const getExtreme = async (field, sortOrder) => {
@@ -469,7 +469,7 @@ app.get('/api/history', async (req, res) => {
     const data = await MeterData.find(query).sort({ timestamp: 1 });
     console.log(`📈 Found ${data.length} history records`);
     // In production, we might want to group this data instead of returning all raw points.
-    // However, since readings are every 10s, an hour is ~360 points (fine for chart).
+    // However, since readings are every 7s, an hour is ~360 points (fine for chart).
     // A day is ~8640 points (might need downsampling, doing simple skip for now)
     
     let chartData = data;
@@ -529,7 +529,7 @@ app.post('/api/settings', verifyToken, async (req, res) => {
 app.get('/api/notifications', verifyToken, async (req, res) => {
   try {
     const userEmail = req.user.email;
-    const latest = await Notification.find({ userEmail }).sort({ timestamp: -1 }).limit(100);
+    const latest = await Notification.find({ userEmail }).sort({ timestamp: -1 }).limit(70);
     res.json(latest);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -771,7 +771,7 @@ app.get('/api/analysis/period-stats', async (req, res) => {
     // and it's missing from DailyUsage, calculate it from raw data.
     if (historicalUsages.length === 0 && start < todayStart) {
       // Calculate how many days we are looking for
-      const dayDiff = Math.ceil((todayStart - start) / (1000 * 60 * 60 * 24));
+      const dayDiff = Math.ceil((todayStart - start) / (700 * 60 * 60 * 24));
       
       // If it's a small range (last 2 days), we can afford to calculate it live
       if (dayDiff <= 2) {
@@ -795,16 +795,16 @@ app.get('/api/analysis/period-stats', async (req, res) => {
           _id: null,
           avgPF: { $avg: "$PF" },
           maxKVA: { $max: "$KVA" },
-          minKVA: { $min: { $cond: [{ $gt: ["$KVA", 0] }, "$KVA", 1000000] } }, // Use large fallback for min
+          minKVA: { $min: { $cond: [{ $gt: ["$KVA", 0] }, "$KVA", 700000] } }, // Use large fallback for min
           maxKW: { $max: "$KW" },
-          minKW: { $min: { $cond: [{ $gt: ["$KW", 0] }, "$KW", 1000000] } },
+          minKW: { $min: { $cond: [{ $gt: ["$KW", 0] }, "$KW", 700000] } },
         }}
       ]);
       if (stats.length > 0) {
         todayStats = stats[0];
         // Correct min values if no data > 0 was found
-        if (todayStats.minKVA === 1000000) todayStats.minKVA = 0;
-        if (todayStats.minKW === 1000000) todayStats.minKW = 0;
+        if (todayStats.minKVA === 700000) todayStats.minKVA = 0;
+        if (todayStats.minKW === 700000) todayStats.minKW = 0;
         
         // For today's extreme times, we need a separate query since aggregate doesn't return which record had the max
         const getLiveExtreme = async (field, sortOrder) => {
@@ -949,7 +949,7 @@ app.get('/api/analysis/range-usage', async (req, res) => {
 
     // 1.1 Fallback: If no summaries found but range is recent, calculate consumption live
     if (usages.length === 0 && end < todayStart) {
-      const dayDiff = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+      const dayDiff = Math.ceil((end - start) / (700 * 60 * 60 * 24)) + 1;
       if (dayDiff <= 3) {
         const fallbackData = [];
         for (let i = 0; i < dayDiff; i++) {

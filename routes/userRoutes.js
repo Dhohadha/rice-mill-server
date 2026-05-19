@@ -109,6 +109,12 @@ router.post('/register', async (req, res) => {
 // Admin Route: Get hierarchical user data (Owners and their Shared Users)
 router.get('/', async (req, res) => {
   try {
+    // Self-healing: Ensure any user with a populated mainUserEmail has isSharedUser set to true
+    await User.updateMany(
+      { mainUserEmail: { $exists: true, $ne: null, $ne: "" }, isSharedUser: { $ne: true } },
+      { $set: { isSharedUser: true } }
+    );
+
     // 1. Fetch all users
     const allUsers = await User.find();
     

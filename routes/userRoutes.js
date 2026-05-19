@@ -189,7 +189,9 @@ router.get('/:email', async (req, res) => {
 router.post('/:email/devices', async (req, res) => {
   try {
     const { email } = req.params;
-    const { deviceId } = req.body;
+    const deviceId = req.body.deviceId ? req.body.deviceId.trim() : '';
+    if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+
     let user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
@@ -220,10 +222,11 @@ router.post('/:email/devices', async (req, res) => {
 router.delete('/:email/devices/:deviceId', async (req, res) => {
   try {
     const { email, deviceId } = req.params;
+    const trimmedDeviceId = deviceId ? deviceId.trim() : '';
     let user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    user.assignedDevices = user.assignedDevices.filter(id => id !== deviceId);
+    user.assignedDevices = user.assignedDevices.filter(id => id.trim() !== trimmedDeviceId);
     await user.save();
     const updatedUser = await getHierarchicalUser(email);
     res.json({ message: 'Device removed successfully', user: updatedUser });

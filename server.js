@@ -80,6 +80,21 @@ mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
         { $or: [{ pfLimit: 0.90 }, { pfLimit: { $exists: false } }] }, 
         { $set: { pfLimit: 0.85 } }
       );
+
+      // Self-heal: Trim assignedDevices for all users to prevent trailing space issues
+      const User = require('./models/User');
+      const allUsers = await User.find({});
+      for (const u of allUsers) {
+        if (u.assignedDevices && u.assignedDevices.length > 0) {
+          const trimmedDevices = u.assignedDevices.map(d => d.trim()).filter(d => d.length > 0);
+          const isChanged = JSON.stringify(u.assignedDevices) !== JSON.stringify(trimmedDevices);
+          if (isChanged) {
+            u.assignedDevices = trimmedDevices;
+            await u.save();
+            console.log(`✅ [Self-Heal] Trimmed assignedDevices for user ${u.email}:`, trimmedDevices);
+          }
+        }
+      }
     } catch (e) {
       console.log('⚠️  Note: Cleanup or migration failed:', e.message);
     }

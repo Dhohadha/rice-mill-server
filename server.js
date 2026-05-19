@@ -103,6 +103,10 @@ mqttClient.on('connect', () => {
 const lastSaveTimes = new Map();
 const SAVE_INTERVAL = 60 * 1000; // 1 minute
 
+// Consecutive breach counters to prevent transient spikes
+// Key structure: `${userEmail}_${deviceId}_${alertType}`
+const consecutiveBreachCounts = {};
+
 // Process incoming MQTT messages
 mqttClient.on('message', async (topic, message) => {
   console.log(`📩 Received message on [${topic}]:`, message.toString());
@@ -169,15 +173,44 @@ mqttClient.on('message', async (topic, message) => {
           await settings.save();
         }
 
+        const alertsToCheck = [
+          {
+            type: 'CMD',
+            isBreached: payload.KVA && payload.KVA > settings.cmdLimit,
+            msg: `CMD Alert: Current kVA (${payload.KVA}) exceeded limit (${settings.cmdLimit})!`
+          },
+          {
+            type: 'POWER',
+            isBreached: payload.KW && payload.KW > settings.powerLimit,
+            msg: `POWER Alert: Current kW (${payload.KW}) exceeded limit (${settings.powerLimit})!`
+          },
+          {
+            type: 'PF',
+            isBreached: payload.PF && payload.PF < settings.pfLimit,
+            msg: `PF Alert: Current PF (${payload.PF}) fell below limit (${settings.pfLimit})!`
+          }
+        ];
+
         const alerts = [];
-        if (payload.KVA && payload.KVA > settings.cmdLimit) {
-          alerts.push({ type: 'CMD', msg: `CMD Alert: Current kVA (${payload.KVA}) exceeded limit (${settings.cmdLimit})!`});
-        }
-        if (payload.KW && payload.KW > settings.powerLimit) {
-          alerts.push({ type: 'POWER', msg: `POWER Alert: Current kW (${payload.KW}) exceeded limit (${settings.powerLimit})!`});
-        }
-        if (payload.PF && payload.PF < settings.pfLimit) {
-          alerts.push({ type: 'PF', msg: `PF Alert: Current PF (${payload.PF}) fell below limit (${settings.pfLimit})!`});
+
+        for (const alertCheck of alertsToCheck) {
+          const key = `${user.email}_${payload.deviceId}_${alertCheck.type}`;
+          
+          if (alertCheck.isBreached) {
+            consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
+            console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/10`);
+            
+            // Trigger alert on exactly the 10th consecutive breach
+            if (consecutiveBreachCounts[key] === 10) {
+              alerts.push({ type: alertCheck.type, msg: alertCheck.msg });
+            }
+          } else {
+            // Reset counter when value is back in the normal range
+            if (consecutiveBreachCounts[key] > 0) {
+              console.log(`✅ [Alert Recovered] ${key} - reset breach counter to 0`);
+              consecutiveBreachCounts[key] = 0;
+            }
+          }
         }
 
         for (let alert of alerts) {

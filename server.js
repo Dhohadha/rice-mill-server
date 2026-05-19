@@ -50,16 +50,16 @@ app.get('/', (req, res) => res.json({ status: 'ok', message: 'Rice Mill Server i
 
 // Socket.io Connection Logic
 io.on('connection', (socket) => {
-  console.log('🔌 New client connected via WebSocket:', socket.id);
+  // console.log('🔌 New client connected via WebSocket:', socket.id);
   
   // Clients can join rooms based on device IDs they are authorized to view
   socket.on('joinDeviceRoom', (deviceId) => {
     socket.join(deviceId);
-    console.log(`Client ${socket.id} joined room: ${deviceId}`);
+    // console.log(`Client ${socket.id} joined room: ${deviceId}`);
   });
 
   socket.on('disconnect', () => {
-    console.log('❌ Client disconnected:', socket.id);
+    // console.log('❌ Client disconnected:', socket.id);
   });
 });
 
@@ -124,7 +124,7 @@ const consecutiveBreachCounts = {};
 
 // Process incoming MQTT messages
 mqttClient.on('message', async (topic, message) => {
-  console.log(`📩 Received message on [${topic}]:`, message.toString());
+  // console.log(`📩 Received message on [${topic}]:`, message.toString());
   
   let deviceId = null;
   if (topic === 'EMS1/data') {
@@ -171,7 +171,7 @@ mqttClient.on('message', async (topic, message) => {
         const newData = new MeterData(payload);
         await newData.save();
         lastSaveTimes.set(deviceId, now);
-        console.log(`💾 Data saved to MongoDB for ${deviceId}: KW=${payload.KW?.toFixed(2)}, KVA=${payload.KVA?.toFixed(2)}, PF=${payload.PF?.toFixed(3)}, KWH=${payload.KWH}`);
+        // console.log(`💾 Data saved to MongoDB for ${deviceId}: KW=${payload.KW?.toFixed(2)}, KVA=${payload.KVA?.toFixed(2)}, PF=${payload.PF?.toFixed(3)}, KWH=${payload.KWH}`);
       }
 
     // Emit data over WebSockets to specific device room
@@ -213,7 +213,7 @@ mqttClient.on('message', async (topic, message) => {
           
           if (alertCheck.isBreached) {
             consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
-            console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
+            // console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
             
             // Trigger alert on exactly the 7th consecutive breach and reset counter
             if (consecutiveBreachCounts[key] === 7) {
@@ -223,7 +223,7 @@ mqttClient.on('message', async (topic, message) => {
           } else {
             // Reset counter when value is back in the normal range
             if (consecutiveBreachCounts[key] > 0) {
-              console.log(`✅ [Alert Recovered] ${key} - reset breach counter to 0`);
+              // console.log(`✅ [Alert Recovered] ${key} - reset breach counter to 0`);
               consecutiveBreachCounts[key] = 0;
             }
           }
@@ -382,7 +382,7 @@ async function calculateHistoricalDayStats(deviceId, date) {
   const end = new Date(date);
   end.setHours(23, 59, 59, 999);
 
-  console.log(`🔍 Calculating on-the-fly stats for ${deviceId} on ${start.toDateString()}...`);
+  // console.log(`🔍 Calculating on-the-fly stats for ${deviceId} on ${start.toDateString()}...`);
 
   // 1. Basic Aggregation (Avg PF, Max/Min Values)
   const stats = await MeterData.aggregate([
@@ -398,7 +398,7 @@ async function calculateHistoricalDayStats(deviceId, date) {
   ]);
 
   if (stats.length === 0) {
-    console.log(`⚠️ No MeterData found for ${deviceId} on ${start.toDateString()}`);
+    // console.log(`⚠️ No MeterData found for ${deviceId} on ${start.toDateString()}`);
     return null;
   }
 
@@ -477,13 +477,13 @@ app.get('/api/history', async (req, res) => {
       startDate.setHours(now.getHours() - 24);
     }
 
-    console.log(`📊 Fetching history for range: ${range}`);
+    // console.log(`📊 Fetching history for range: ${range}`);
     const { deviceId } = req.query;
     const query = { timestamp: { $gte: startDate } };
     if (deviceId) query.deviceId = deviceId;
     
     const data = await MeterData.find(query).sort({ timestamp: 1 });
-    console.log(`📈 Found ${data.length} history records`);
+    // console.log(`📈 Found ${data.length} history records`);
     // In production, we might want to group this data instead of returning all raw points.
     // However, since readings are every 7s, an hour is ~360 points (fine for chart).
     // A day is ~8640 points (might need downsampling, doing simple skip for now)
@@ -514,7 +514,7 @@ app.get('/api/settings', verifyToken, async (req, res) => {
       settings = new UserSettings({ userEmail });
       await settings.save();
     }
-    console.log(`⚙️ Settings fetched for ${userEmail}`);
+    // console.log(`⚙️ Settings fetched for ${userEmail}`);
     res.json(settings);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -536,7 +536,7 @@ app.post('/api/settings', verifyToken, async (req, res) => {
       { $set: updates },
       { returnDocument: 'after', upsert: true }
     );
-    console.log(`✅ Settings updated for ${userEmail}:`, updates);
+    // console.log(`✅ Settings updated for ${userEmail}:`, updates);
     res.json(settings);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -580,7 +580,7 @@ app.post('/api/fcm-token', verifyToken, async (req, res) => {
       { userEmail, lastUpdated: Date.now() },
       { upsert: true }
     );
-    console.log(`✅ FCM Token registered/updated for ${userEmail}`);
+    // console.log(`✅ FCM Token registered/updated for ${userEmail}`);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -591,7 +591,7 @@ app.post('/api/fcm-token', verifyToken, async (req, res) => {
 app.post('/api/stop-alert', async (req, res) => {
   try {
     const { alertId } = req.body;
-    console.log(`🔕 Alert stopped by user: ${alertId}`);
+    // console.log(`🔕 Alert stopped by user: ${alertId}`);
 
     // Here you could also:
     // 1. Update alert status in DB
@@ -664,7 +664,7 @@ async function calculateTodayConsumption(deviceId) {
   // 1. Get the current latest reading
   const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
   if (!currentNow || !currentNow.KWH) {
-    console.log(`📊 No current KWH reading found for ${deviceId}`);
+    // console.log(`📊 No current KWH reading found for ${deviceId}`);
     return 0;
   }
 
@@ -692,9 +692,9 @@ async function calculateTodayConsumption(deviceId) {
       // Rollover: Meter reset or wrapped around
       todayConsumption = currentNow.KWH;
     }
-    console.log(`📊 Today Consumption for ${deviceId}: ${todayConsumption.toFixed(2)} kWh (Baseline: ${baseline.KWH}, Current: ${currentNow.KWH})`);
+    // console.log(`📊 Today Consumption for ${deviceId}: ${todayConsumption.toFixed(2)} kWh (Baseline: ${baseline.KWH}, Current: ${currentNow.KWH})`);
   } else {
-    console.log(`📊 Baseline not found or invalid for ${deviceId}. Baseline: ${JSON.stringify(baseline)}`);
+    // console.log(`📊 Baseline not found or invalid for ${deviceId}. Baseline: ${JSON.stringify(baseline)}`);
     // If no baseline at all, today's consumption is 0 until we get a second reading
     todayConsumption = 0;
   }

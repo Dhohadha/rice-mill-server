@@ -200,9 +200,10 @@ mqttClient.on('message', async (topic, message) => {
             consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
             console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
             
-            // Trigger alert on exactly the 7th consecutive breach
+            // Trigger alert on exactly the 7th consecutive breach and reset counter
             if (consecutiveBreachCounts[key] === 7) {
               alerts.push({ type: alertCheck.type, msg: alertCheck.msg });
+              consecutiveBreachCounts[key] = 0;
             }
           } else {
             // Reset counter when value is back in the normal range

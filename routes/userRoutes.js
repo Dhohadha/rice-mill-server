@@ -59,9 +59,46 @@ router.post('/sync', verifyToken, async (req, res) => {
       await user.save();
     }
     
-    res.json({ ...user.toObject(), isRegistered: true });
+    let userObj = user.toObject();
+    if (user.isSharedUser && user.mainUserEmail) {
+      const mainUser = await User.findOne({ email: user.mainUserEmail.toLowerCase() });
+      if (mainUser) {
+        userObj.millName = mainUser.millName;
+      }
+    }
+    res.json({ ...userObj, isRegistered: true });
   } catch (err) {
     console.error('Error syncing user:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authenticated Route: Update self profile (name, phone, millName)
+router.put('/profile/update', verifyToken, async (req, res) => {
+  try {
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const { name, phone, millName } = req.body;
+    if (name) user.name = name;
+    if (phone) user.phone = phone;
+    // Only allow updating millName if not a shared user (shared users inherit the owner's millName)
+    if (millName !== undefined && !user.isSharedUser) {
+      user.millName = millName;
+    }
+
+    await user.save();
+    
+    // Return updated hierarchical profile
+    let userObj = user.toObject();
+    if (user.isSharedUser && user.mainUserEmail) {
+      const mainUser = await User.findOne({ email: user.mainUserEmail.toLowerCase() });
+      if (mainUser) {
+        userObj.millName = mainUser.millName;
+      }
+    }
+    res.json({ message: 'Profile updated successfully', user: userObj });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -94,7 +131,7 @@ router.post('/register', async (req, res) => {
       phone,
       email: normalizedEmail,
       role: 'User',
-      millName: millName || 'Rice Mill',
+      millName: millName || '',
       assignedDevices: deviceId ? [deviceId] : []
     });
     await user.save();
@@ -131,6 +168,18 @@ router.get('/', async (req, res) => {
     });
 
     res.json(hierarchicalData);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin Route: Get details of a single user (Owner or Shared User)
+router.get('/:email', async (req, res) => {
+  try {
+    const { email } = req.params;
+    const user = await getHierarchicalUser(email);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json(user);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

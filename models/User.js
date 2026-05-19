@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: ['Admin', 'User', 'Guest'], default: 'User' },
   fcmToken: { type: String },
   assignedDevices: [{ type: String }], // Array of MAC addresses/Device IDs
-  millName: { type: String, default: 'Rice Mill' },
+  millName: { type: String, default: '' },
   isSharedUser: { type: Boolean, default: false },
   mainUserEmail: { type: String }, // Who gave them access
   sharedWith: [{ type: String }], // Emails of people they shared with

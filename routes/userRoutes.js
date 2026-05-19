@@ -51,6 +51,13 @@ router.post('/sync', verifyToken, async (req, res) => {
       user.revokedBy = null;
       await user.save();
     }
+
+    // If revoked user has active assigned devices, clear the revoked flag
+    if (user.accessRevoked && user.assignedDevices && user.assignedDevices.length > 0) {
+      user.accessRevoked = false;
+      user.revokedBy = null;
+      await user.save();
+    }
     
     res.json({ ...user.toObject(), isRegistered: true });
   } catch (err) {
@@ -131,8 +138,20 @@ router.post('/:email/devices', async (req, res) => {
     let user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
+    let modified = false;
     if (!user.assignedDevices.includes(deviceId)) {
       user.assignedDevices.push(deviceId);
+      modified = true;
+    }
+
+    // If access was previously revoked, clear it now that a device is assigned
+    if (user.accessRevoked) {
+      user.accessRevoked = false;
+      user.revokedBy = null;
+      modified = true;
+    }
+
+    if (modified) {
       await user.save();
     }
     const updatedUser = await getHierarchicalUser(email);
@@ -173,6 +192,9 @@ router.post('/:email/share', async (req, res) => {
       });
       sharedUser.isSharedUser = true;
       sharedUser.mainUserEmail = owner.email;
+      // Clear access revoked flag if they are being shared with again
+      sharedUser.accessRevoked = false;
+      sharedUser.revokedBy = null;
       await sharedUser.save();
     } else {
       sharedUser = new User({
@@ -261,6 +283,12 @@ router.put('/:email', async (req, res) => {
     if (phone) user.phone = phone;
     if (millName) user.millName = millName;
     if (role) user.role = role;
+    
+    // Clear access revoked flag if the admin is updating the profile
+    if (user.accessRevoked) {
+      user.accessRevoked = false;
+      user.revokedBy = null;
+    }
     
     if (newEmail && newEmail.toLowerCase() !== user.email) {
       const normalizedNewEmail = newEmail.toLowerCase();

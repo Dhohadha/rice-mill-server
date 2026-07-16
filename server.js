@@ -141,7 +141,27 @@ mqttClient.on('message', async (topic, message) => {
       const payload = JSON.parse(message.toString());
       if (payload.status === "no_data") return; 
       
-      // Map incoming fields to schema fields
+      // Map incoming fields to schema fields (New Format Support)
+      if (payload.TotalKW !== undefined) {
+        payload.KW = payload.TotalKW / 1000;
+      }
+      if (payload.TotalKVA !== undefined) {
+        payload.KVA = payload.TotalKVA / 1000;
+      }
+      if (payload.TotalKVAR !== undefined) {
+        payload.KVAR = payload.TotalKVAR / 1000;
+      }
+      if (payload.TotalPF !== undefined) {
+        payload.PF = payload.TotalPF;
+      }
+      if (payload.ImportWh !== undefined) {
+        payload.KWH = payload.ImportWh;
+      }
+      if (payload.ImportVAh !== undefined) {
+        payload.KVAH = payload.ImportVAh;
+      }
+
+      // Map incoming fields to schema fields (Old Format Support)
       if (payload.KW1 !== undefined) {
         payload.KW_R = payload.KW1;
         payload.KW_Y = payload.KW2;

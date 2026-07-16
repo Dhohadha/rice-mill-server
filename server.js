@@ -895,8 +895,17 @@ app.get('/api/analysis/mixed-stats', async (req, res) => {
     todayStart.setHours(0, 0, 0, 0);
 
     let totalConsumed = 0;
+    
     let globalMaxKVA = 0;
     let globalMaxKVATime = null;
+    let globalMinKVA = null;
+    let globalMinKVATime = null;
+
+    let globalMaxKW = 0;
+    let globalMaxKWTime = null;
+    let globalMinKW = null;
+    let globalMinKWTime = null;
+
     let globalAvgPF = 0;
     let pfCount = 0;
 
@@ -905,10 +914,29 @@ app.get('/api/analysis/mixed-stats', async (req, res) => {
       const summaries = await DailyUsage.find({ deviceId: dId, date: { $gte: start, $lt: todayStart } }).lean();
       for (const s of summaries) {
         totalConsumed += (s.totalKWh || 0);
+
+        // Max KVA
         if ((s.maxKVA || 0) > globalMaxKVA) {
           globalMaxKVA = s.maxKVA;
           globalMaxKVATime = s.maxKVATime;
         }
+        // Min KVA (excluding 0)
+        if (s.minKVA > 0 && (globalMinKVA === null || s.minKVA < globalMinKVA)) {
+          globalMinKVA = s.minKVA;
+          globalMinKVATime = s.minKVATime;
+        }
+
+        // Max KW
+        if ((s.maxKW || 0) > globalMaxKW) {
+          globalMaxKW = s.maxKW;
+          globalMaxKWTime = s.maxKWTime;
+        }
+        // Min KW (excluding 0)
+        if (s.minKW > 0 && (globalMinKW === null || s.minKW < globalMinKW)) {
+          globalMinKW = s.minKW;
+          globalMinKWTime = s.minKWTime;
+        }
+
         globalAvgPF += (s.avgPF || 0);
         pfCount++;
       }
@@ -917,15 +945,48 @@ app.get('/api/analysis/mixed-stats', async (req, res) => {
       totalConsumed += await calculateTodayConsumption(dId);
       const liveData = await MeterData.aggregate([
         { $match: { deviceId: dId, timestamp: { $gte: todayStart } } },
-        { $group: { _id: null, maxKVA: { $max: "$KVA" }, avgPF: { $avg: "$PF" } } }
+        { $group: { 
+            _id: null, 
+            maxKVA: { $max: "$KVA" }, 
+            minKVA: { $min: { $cond: [{ $gt: ["$KVA", 0] }, "$KVA", 700000] } },
+            maxKW: { $max: "$KW" }, 
+            minKW: { $min: { $cond: [{ $gt: ["$KW", 0] }, "$KW", 700000] } },
+            avgPF: { $avg: "$PF" } 
+        } }
       ]);
+
       if (liveData.length > 0) {
-        if (liveData[0].maxKVA > globalMaxKVA) {
-          globalMaxKVA = liveData[0].maxKVA;
-          // We could fetch the exact time but skipping for mixed stats to keep it fast
-          globalMaxKVATime = new Date(); 
+        const live = liveData[0];
+        if (live.minKVA === 700000) live.minKVA = 0;
+        if (live.minKW === 700000) live.minKW = 0;
+
+        // Max KVA
+        if (live.maxKVA > globalMaxKVA) {
+          globalMaxKVA = live.maxKVA;
+          const rec = await MeterData.findOne({ deviceId: dId, timestamp: { $gte: todayStart }, KVA: live.maxKVA }).sort({ timestamp: 1 }).lean();
+          globalMaxKVATime = rec ? rec.timestamp : new Date();
         }
-        globalAvgPF += (liveData[0].avgPF || 0);
+        // Min KVA
+        if (live.minKVA > 0 && (globalMinKVA === null || live.minKVA < globalMinKVA)) {
+          globalMinKVA = live.minKVA;
+          const rec = await MeterData.findOne({ deviceId: dId, timestamp: { $gte: todayStart }, KVA: live.minKVA }).sort({ timestamp: 1 }).lean();
+          globalMinKVATime = rec ? rec.timestamp : new Date();
+        }
+
+        // Max KW
+        if (live.maxKW > globalMaxKW) {
+          globalMaxKW = live.maxKW;
+          const rec = await MeterData.findOne({ deviceId: dId, timestamp: { $gte: todayStart }, KW: live.maxKW }).sort({ timestamp: 1 }).lean();
+          globalMaxKWTime = rec ? rec.timestamp : new Date();
+        }
+        // Min KW
+        if (live.minKW > 0 && (globalMinKW === null || live.minKW < globalMinKW)) {
+          globalMinKW = live.minKW;
+          const rec = await MeterData.findOne({ deviceId: dId, timestamp: { $gte: todayStart }, KW: live.minKW }).sort({ timestamp: 1 }).lean();
+          globalMinKWTime = rec ? rec.timestamp : new Date();
+        }
+
+        globalAvgPF += (live.avgPF || 0);
         pfCount++;
       }
     }
@@ -933,8 +994,18 @@ app.get('/api/analysis/mixed-stats', async (req, res) => {
     res.json({
       totalConsumedKWh: totalConsumed,
       avgPF: pfCount > 0 ? globalAvgPF / pfCount : 0,
-      kva: { max: globalMaxKVA, maxTime: globalMaxKVATime },
-      // Mixed stats usually only show top level summaries
+      kva: { 
+        max: globalMaxKVA, 
+        maxTime: globalMaxKVATime,
+        min: globalMinKVA || 0,
+        minTime: globalMinKVATime
+      },
+      kw: {
+        max: globalMaxKW,
+        maxTime: globalMaxKWTime,
+        min: globalMinKW || 0,
+        minTime: globalMinKWTime
+      }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

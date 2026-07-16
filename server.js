@@ -103,7 +103,7 @@ mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
 
 // MQTT Setup
 const MQTT_BROKER = 'mqtt://broker.emqx.io:1883';
-const MQTT_TOPICS = ['EMS1/data', 'EMS/+/data'];
+const MQTT_TOPICS = ['EMS1/data', 'EMS/+/data', 'APFC1/data'];
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
 mqttClient.on('connect', () => {
@@ -129,6 +129,8 @@ mqttClient.on('message', async (topic, message) => {
   let deviceId = null;
   if (topic === 'EMS1/data') {
     deviceId = 'RICE_MILL_001';
+  } else if (topic === 'APFC1/data') {
+    deviceId = 'APFC_001';
   } else if (topic.startsWith('EMS/') && topic.endsWith('/data')) {
     // Pattern: EMS/DEVICE_ID/data
     deviceId = topic.split('/')[1];

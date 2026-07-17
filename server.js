@@ -117,6 +117,7 @@ mqttClient.on('connect', () => {
 // Throttle control for saving data (per device)
 const lastSaveTimes = new Map();
 const SAVE_INTERVAL = 60 * 700; // 1 minute
+const deviceStatuses = new Map(); // Track online/offline status
 
 // Consecutive breach counters to prevent transient spikes
 // Key structure: `${userEmail}_${deviceId}_${alertType}`
@@ -141,6 +142,20 @@ mqttClient.on('message', async (topic, message) => {
       const payload = JSON.parse(message.toString());
       if (payload.status === "no_data") return; 
       
+      const previousStatus = deviceStatuses.get(deviceId) || 'online';
+      const currentStatus = payload.status === 'error' ? 'offline' : 'online';
+      let statusChanged = false;
+
+      if (currentStatus !== previousStatus) {
+        if (currentStatus === 'offline') {
+          console.log(`📡 [STATUS] Device ${deviceId} went OFFLINE`);
+        } else {
+          console.log(`📡 [STATUS] Device ${deviceId} came ONLINE`);
+        }
+        deviceStatuses.set(deviceId, currentStatus);
+        statusChanged = true;
+      }
+
       // Map incoming fields to schema fields (New Format Support)
       if (payload.TotalKW !== undefined) {
         payload.KW = payload.TotalKW / 1000;
@@ -185,125 +200,129 @@ mqttClient.on('message', async (topic, message) => {
       }
 
       payload.deviceId = deviceId;
+      payload.status = currentStatus;
+      payload.timestamp = new Date();
 
       const now = Date.now();
       const lastSaveTime = lastSaveTimes.get(deviceId) || 0;
 
-      if (now - lastSaveTime >= SAVE_INTERVAL) {
+      if (statusChanged || (now - lastSaveTime >= SAVE_INTERVAL)) {
         const newData = new MeterData(payload);
         await newData.save();
         lastSaveTimes.set(deviceId, now);
         // console.log(`💾 Data saved to MongoDB for ${deviceId}: KW=${payload.KW?.toFixed(2)}, KVA=${payload.KVA?.toFixed(2)}, PF=${payload.PF?.toFixed(3)}, KWH=${payload.KWH}`);
       }
 
-    // Emit data over WebSockets to specific device room
-    io.to(payload.deviceId).emit('meterData', payload);
+      // Emit data over WebSockets to specific device room
+      io.to(payload.deviceId).emit('meterData', payload);
 
-      // Alert Check (Per User)
-      const User = require('./models/User');
-      const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });
-      
-      for (const user of usersWithAccess) {
-        let settings = await UserSettings.findOne({ userEmail: user.email });
-        if (!settings) {
-          settings = new UserSettings({ userEmail: user.email });
-          await settings.save();
-        }
-
-        const alertsToCheck = [
-          {
-            type: 'CMD',
-            isBreached: payload.KVA && payload.KVA > settings.cmdLimit,
-            msg: `CMD Alert: Current kVA (${payload.KVA}) exceeded limit (${settings.cmdLimit})!`
-          },
-          {
-            type: 'POWER',
-            isBreached: payload.KW && payload.KW > settings.powerLimit,
-            msg: `POWER Alert: Current kW (${payload.KW}) exceeded limit (${settings.powerLimit})!`
-          },
-          {
-            type: 'PF',
-            isBreached: payload.KVA && payload.KVA >= 10 && payload.KW && payload.KW >= 10 && payload.PF && payload.PF < settings.pfLimit,
-            msg: `PF Alert: Current PF (${payload.PF.toFixed(3)}) fell below limit (${settings.pfLimit.toFixed(2)})!`
+      if (currentStatus === 'online') {
+        // Alert Check (Per User)
+        const User = require('./models/User');
+        const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });
+        
+        for (const user of usersWithAccess) {
+          let settings = await UserSettings.findOne({ userEmail: user.email });
+          if (!settings) {
+            settings = new UserSettings({ userEmail: user.email });
+            await settings.save();
           }
-        ];
 
-        const alerts = [];
+          const alertsToCheck = [
+            {
+              type: 'CMD',
+              isBreached: payload.KVA && payload.KVA > settings.cmdLimit,
+              msg: `CMD Alert: Current kVA (${payload.KVA}) exceeded limit (${settings.cmdLimit})!`
+            },
+            {
+              type: 'POWER',
+              isBreached: payload.KW && payload.KW > settings.powerLimit,
+              msg: `POWER Alert: Current kW (${payload.KW}) exceeded limit (${settings.powerLimit})!`
+            },
+            {
+              type: 'PF',
+              isBreached: payload.KVA && payload.KVA >= 10 && payload.KW && payload.KW >= 10 && payload.PF && payload.PF < settings.pfLimit,
+              msg: `PF Alert: Current PF (${payload.PF.toFixed(3)}) fell below limit (${settings.pfLimit.toFixed(2)})!`
+            }
+          ];
 
-        for (const alertCheck of alertsToCheck) {
-          const key = `${user.email}_${payload.deviceId}_${alertCheck.type}`;
-          
-          if (alertCheck.isBreached) {
-            consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
-            // console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
+          const alerts = [];
+
+          for (const alertCheck of alertsToCheck) {
+            const key = `${user.email}_${payload.deviceId}_${alertCheck.type}`;
             
-            // Trigger alert on exactly the 7th consecutive breach and reset counter
-            if (consecutiveBreachCounts[key] === 7) {
-              alerts.push({ type: alertCheck.type, msg: alertCheck.msg });
-              consecutiveBreachCounts[key] = 0;
-            }
-          } else {
-            // Reset counter when value is back in the normal range
-            if (consecutiveBreachCounts[key] > 0) {
-              // console.log(`✅ [Alert Recovered] ${key} - reset breach counter to 0`);
-              consecutiveBreachCounts[key] = 0;
+            if (alertCheck.isBreached) {
+              consecutiveBreachCounts[key] = (consecutiveBreachCounts[key] || 0) + 1;
+              // console.log(`⚠️  [Alert Check] ${key} - consecutive breaches: ${consecutiveBreachCounts[key]}/7`);
+              
+              // Trigger alert on exactly the 7th consecutive breach and reset counter
+              if (consecutiveBreachCounts[key] === 7) {
+                alerts.push({ type: alertCheck.type, msg: alertCheck.msg });
+                consecutiveBreachCounts[key] = 0;
+              }
+            } else {
+              // Reset counter when value is back in the normal range
+              if (consecutiveBreachCounts[key] > 0) {
+                // console.log(`✅ [Alert Recovered] ${key} - reset breach counter to 0`);
+                consecutiveBreachCounts[key] = 0;
+              }
             }
           }
-        }
 
-        for (let alert of alerts) {
-          // Prevent spamming the same user with the same alert type within 5 minutes
-          const recentAlert = await Notification.findOne({
-            type: alert.type,
-            userEmail: user.email, // We should add userEmail to Notification model too
-            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 700) }
-          });
-          
-          if (!recentAlert) {
-            await new Notification({ 
-              deviceId: payload.deviceId,
-              title: `Limit Exceeded`, 
-              message: alert.msg, 
+          for (let alert of alerts) {
+            // Prevent spamming the same user with the same alert type within 5 minutes
+            const recentAlert = await Notification.findOne({
               type: alert.type,
-              userEmail: user.email.toLowerCase() 
-            }).save();
+              userEmail: user.email, // We should add userEmail to Notification model too
+              timestamp: { $gte: new Date(Date.now() - 5 * 60 * 700) }
+            });
             
-            // Send FCM push notifications to THIS user specifically
-            try {
-              const normalizedEmail = user.email.toLowerCase();
-              const tokens = await DeviceToken.find({ userEmail: normalizedEmail });
-              const registrationTokens = tokens.map(t => t.token);
+            if (!recentAlert) {
+              await new Notification({ 
+                deviceId: payload.deviceId,
+                title: `Limit Exceeded`, 
+                message: alert.msg, 
+                type: alert.type,
+                userEmail: user.email.toLowerCase() 
+              }).save();
+              
+              // Send FCM push notifications to THIS user specifically
+              try {
+                const normalizedEmail = user.email.toLowerCase();
+                const tokens = await DeviceToken.find({ userEmail: normalizedEmail });
+                const registrationTokens = tokens.map(t => t.token);
 
-              if (registrationTokens.length > 0) {
-                const message = {
-                  data: {
-                    title: `⚠️ Alert: ${payload.deviceId}`,
-                    body: alert.msg,
-                    alertId: alert.type === 'PF' ? 'PF' : `ALERT_${Date.now()}`,
-                    deviceId: payload.deviceId,
-                  },
-                  tokens: registrationTokens,
-                  android: {
-                    priority: 'high',
-                  },
-                };
+                if (registrationTokens.length > 0) {
+                  const message = {
+                    data: {
+                      title: `⚠️ Alert: ${payload.deviceId}`,
+                      body: alert.msg,
+                      alertId: alert.type === 'PF' ? 'PF' : `ALERT_${Date.now()}`,
+                      deviceId: payload.deviceId,
+                    },
+                    tokens: registrationTokens,
+                    android: {
+                      priority: 'high',
+                    },
+                  };
 
-                const response = await admin.messaging().sendEachForMulticast(message);
-                console.log(`📲 Successfully sent ${response.successCount} push notifications to ${user.email}`);
-                
-                // Cleanup invalid tokens
-                if (response.failureCount > 0) {
-                  const failedTokens = [];
-                  response.responses.forEach((resp, idx) => {
-                    if (!resp.success) failedTokens.push(registrationTokens[idx]);
-                  });
-                  if (failedTokens.length > 0) {
-                    await DeviceToken.deleteMany({ token: { $in: failedTokens } });
+                  const response = await admin.messaging().sendEachForMulticast(message);
+                  console.log(`📲 Successfully sent ${response.successCount} push notifications to ${user.email}`);
+                  
+                  // Cleanup invalid tokens
+                  if (response.failureCount > 0) {
+                    const failedTokens = [];
+                    response.responses.forEach((resp, idx) => {
+                      if (!resp.success) failedTokens.push(registrationTokens[idx]);
+                    });
+                    if (failedTokens.length > 0) {
+                      await DeviceToken.deleteMany({ token: { $in: failedTokens } });
+                    }
                   }
                 }
+              } catch (fcmErr) {
+                console.error(`❌ FCM Send Error for ${user.email}:`, fcmErr.message);
               }
-            } catch (fcmErr) {
-              console.error(`❌ FCM Send Error for ${user.email}:`, fcmErr.message);
             }
           }
         }

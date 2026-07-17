@@ -34,6 +34,7 @@ const meterDataSchema = new mongoose.Schema({
   I3: Number,
   Freq: Number,
   IN: Number,
+  status: { type: String, default: 'online' },
   timestamp: { type: Date, default: Date.now }
 });
 

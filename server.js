@@ -341,9 +341,26 @@ cron.schedule('0 0 * * *', async () => {
         timestamp: { $gte: yesterday, $lt: todayStart } 
       }).sort({ KWH: -1 });
 
+      const minKvaRec = await MeterData.findOne({ 
+        deviceId, 
+        timestamp: { $gte: yesterday, $lt: todayStart }, 
+        KVAH: { $gt: 0 } 
+      }).sort({ KVAH: 1 });
+      
+      const maxKvaRec = await MeterData.findOne({ 
+        deviceId, 
+        timestamp: { $gte: yesterday, $lt: todayStart } 
+      }).sort({ KVAH: -1 });
+
       if (minRec && maxRec) {
         let consumedKWh = maxRec.KWH - minRec.KWH;
         if (consumedKWh < 0) consumedKWh = maxRec.KWH; // Handle reset
+
+        let consumedKVAh = 0;
+        if (minKvaRec && maxKvaRec) {
+          consumedKVAh = maxKvaRec.KVAH - minKvaRec.KVAH;
+          if (consumedKVAh < 0) consumedKVAh = maxKvaRec.KVAH; // Handle reset
+        }
 
         // 2. Aggregate Max/Min/Avg
         const stats = await MeterData.aggregate([
@@ -369,6 +386,7 @@ cron.schedule('0 0 * * *', async () => {
           { date: yesterday, deviceId },
           { 
             totalKWh: consumedKWh,
+            totalKVAh: consumedKVAh,
             maxKVA: maxKVA ? maxKVA.KVA : 0,
             maxKVATime: maxKVA ? maxKVA.timestamp : null,
             minKVA: minKVA ? minKVA.KVA : 0,
@@ -440,7 +458,7 @@ async function calculateHistoricalDayStats(deviceId, date) {
   const maxKWRec = await getExtreme('KW', -1);
   const minKWRec = await getExtreme('KW', 1);
 
-  // 3. Consumption (KWH Delta)
+  // 3. Consumption (KWH Delta & KVAH Delta)
   const minKwh = await MeterData.findOne({ deviceId, timestamp: { $gte: start, $lte: end }, KWH: { $gt: 0 } })
     .sort({ KWH: 1 })
     .lean();
@@ -454,8 +472,22 @@ async function calculateHistoricalDayStats(deviceId, date) {
     if (consumption < 0) consumption = maxKwh.KWH;
   }
 
+  const minKvah = await MeterData.findOne({ deviceId, timestamp: { $gte: start, $lte: end }, KVAH: { $gt: 0 } })
+    .sort({ KVAH: 1 })
+    .lean();
+  const maxKvah = await MeterData.findOne({ deviceId, timestamp: { $gte: start, $lte: end } })
+    .sort({ KVAH: -1 })
+    .lean();
+
+  let consumptionKVAh = 0;
+  if (minKvah && maxKvah) {
+    consumptionKVAh = maxKvah.KVAH - minKvah.KVAH;
+    if (consumptionKVAh < 0) consumptionKVAh = maxKvah.KVAH;
+  }
+
   return {
     totalKWh: consumption,
+    totalKVAh: consumptionKVAh,
     maxKVA: s.maxKVA || 0,
     maxKVATime: maxKVARec ? maxKVARec.timestamp : null,
     minKVA: s.minKVA || 0,
@@ -670,11 +702,16 @@ app.get('/api/daily-usage', async (req, res) => {
     }).lean();
     
     const archivedTotal = usages.reduce((sum, u) => sum + (u.totalKWh || 0), 0);
+    const archivedKVaTotal = usages.reduce((sum, u) => sum + (u.totalKVAh || 0), 0);
 
     // 2. Get live total for today
     const liveToday = await calculateTodayConsumption(deviceId);
+    const liveKvaToday = await calculateTodayKvaConsumption(deviceId);
 
-    res.json({ totalKWhConsumed: archivedTotal + liveToday });
+    res.json({ 
+      totalKWhConsumed: archivedTotal + liveToday,
+      totalKVaConsumed: archivedKVaTotal + liveKvaToday
+    });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -724,6 +761,45 @@ async function calculateTodayConsumption(deviceId) {
   return todayConsumption;
 }
 
+// Helper to calculate live today KVA consumption
+async function calculateTodayKvaConsumption(deviceId) {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
+  if (!currentNow || !currentNow.KVAH) {
+    return 0;
+  }
+
+  let baseline = await MeterData.findOne({ 
+    deviceId, 
+    timestamp: { $lt: todayStart },
+    KVAH: { $gt: 0 }
+  }).sort({ timestamp: -1 }).lean();
+
+  if (!baseline) {
+    baseline = await MeterData.findOne({ 
+      deviceId, 
+      timestamp: { $gte: todayStart },
+      KVAH: { $gt: 0 }
+    }).sort({ timestamp: 1 }).lean();
+  }
+
+  let todayConsumption = 0;
+  if (baseline && baseline.KVAH && currentNow && currentNow.KVAH) {
+    if (currentNow.KVAH >= baseline.KVAH) {
+      todayConsumption = currentNow.KVAH - baseline.KVAH;
+    } else {
+      // Rollover: Meter reset or wrapped around
+      todayConsumption = currentNow.KVAH;
+    }
+  } else {
+    todayConsumption = 0;
+  }
+  
+  return todayConsumption;
+}
+
 // Get Today's Consumption (Midnight to Now)
 app.get('/api/today-usage', async (req, res) => {
   try {
@@ -731,7 +807,11 @@ app.get('/api/today-usage', async (req, res) => {
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
 
     const todayConsumption = await calculateTodayConsumption(deviceId);
-    res.json({ todayKWh: todayConsumption });
+    const todayKvaConsumption = await calculateTodayKvaConsumption(deviceId);
+    res.json({ 
+      todayKWh: todayConsumption,
+      todayKVAh: todayKvaConsumption
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1072,13 +1152,15 @@ app.get('/api/analysis/range-usage', async (req, res) => {
     }
 
     let totalConsumed = usages.reduce((sum, u) => sum + (u.totalKWh || 0), 0);
+    let totalKVaConsumed = usages.reduce((sum, u) => sum + (u.totalKVAh || 0), 0);
 
     // 2. If end date includes today, add live today consumption
     if (end >= todayStart) {
       totalConsumed += await calculateTodayConsumption(deviceId);
+      totalKVaConsumed += await calculateTodayKvaConsumption(deviceId);
     }
 
-    res.json({ totalKWhConsumed: totalConsumed });
+    res.json({ totalKWhConsumed: totalConsumed, totalKVaConsumed: totalKVaConsumed });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1097,7 +1179,11 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
           year: { $year: "$date" },
           month: { $month: "$date" }
         },
-        totalKWh: { $sum: "$totalKWh" }
+        totalKWh: { $sum: "$totalKWh" },
+        totalKVAh: { $sum: "$totalKVAh" },
+        maxKVA: { $max: "$maxKVA" },
+        maxKW: { $max: "$maxKW" },
+        avgPF: { $avg: "$avgPF" }
       }},
       { $sort: { "_id.year": -1, "_id.month": -1 } }
     ]);
@@ -1106,7 +1192,11 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
     const formattedData = monthlyData.map(d => ({
       year: d._id.year,
       month: d._id.month,
-      totalKWh: d.totalKWh
+      totalKWh: d.totalKWh,
+      totalKVAh: d.totalKVAh || 0,
+      maxKVA: d.maxKVA || 0,
+      maxKW: d.maxKW || 0,
+      avgPF: d.avgPF || 0
     }));
 
     // Add current month's live data
@@ -1115,15 +1205,47 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
     const currentMonth = now.getMonth() + 1;
 
     let currentMonthEntry = formattedData.find(d => d.year === currentYear && d.month === currentMonth);
-    const liveToday = await calculateTodayConsumption(deviceId);
+    const liveKwhToday = await calculateTodayConsumption(deviceId);
+    const liveKvahToday = await calculateTodayKvaConsumption(deviceId);
+
+    // Let's get today's stats to update live month's max and avg PF
+    const todayStart = new Date();
+    todayStart.setHours(0,0,0,0);
+    const todayStats = await MeterData.aggregate([
+      { $match: { deviceId, timestamp: { $gte: todayStart } } },
+      { $group: {
+        _id: null,
+        avgPF: { $avg: "$PF" },
+        maxKVA: { $max: "$KVA" },
+        maxKW: { $max: "$KW" }
+      }}
+    ]);
+    
+    const todayMaxKVA = todayStats.length > 0 ? (todayStats[0].maxKVA || 0) : 0;
+    const todayMaxKW = todayStats.length > 0 ? (todayStats[0].maxKW || 0) : 0;
+    const todayAvgPF = todayStats.length > 0 ? (todayStats[0].avgPF || 0) : 0;
 
     if (currentMonthEntry) {
-      currentMonthEntry.totalKWh += liveToday;
+      currentMonthEntry.totalKWh += liveKwhToday;
+      currentMonthEntry.totalKVAh += liveKvahToday;
+      if (todayMaxKVA > currentMonthEntry.maxKVA) currentMonthEntry.maxKVA = todayMaxKVA;
+      if (todayMaxKW > currentMonthEntry.maxKW) currentMonthEntry.maxKW = todayMaxKW;
+      
+      // Recompute simple average PF for current month:
+      const startOfMonth = new Date(currentYear, now.getMonth(), 1);
+      const thisMonthDailies = await DailyUsage.find({ deviceId, date: { $gte: startOfMonth, $lt: todayStart } }).lean();
+      const totalPF = thisMonthDailies.reduce((sum, u) => sum + (u.avgPF || 0), 0) + todayAvgPF;
+      const countPF = thisMonthDailies.length + 1;
+      currentMonthEntry.avgPF = countPF > 0 ? totalPF / countPF : 0;
     } else {
       formattedData.unshift({
         year: currentYear,
         month: currentMonth,
-        totalKWh: liveToday
+        totalKWh: liveKwhToday,
+        totalKVAh: liveKvahToday,
+        maxKVA: todayMaxKVA,
+        maxKW: todayMaxKW,
+        avgPF: todayAvgPF
       });
     }
 

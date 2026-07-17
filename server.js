@@ -223,8 +223,8 @@ mqttClient.on('message', async (topic, message) => {
           },
           {
             type: 'PF',
-            isBreached: payload.PF && payload.PF < settings.pfLimit,
-            msg: `PF Alert: Current PF (${payload.PF}) fell below limit (${settings.pfLimit})!`
+            isBreached: payload.KVA && payload.KVA >= 10 && payload.KW && payload.KW >= 10 && payload.PF && payload.PF < settings.pfLimit,
+            msg: `PF Alert: Current PF (${payload.PF.toFixed(3)}) fell below limit (${settings.pfLimit.toFixed(2)})!`
           }
         ];
 

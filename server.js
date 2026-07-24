@@ -17,6 +17,8 @@ const admin = require('firebase-admin');
 
 // Routes
 const userRoutes = require('./routes/userRoutes');
+const emailReportRoutes = require('./routes/emailReportRoutes');
+const { processDailyEmailExport } = require('./services/emailService');
 const { verifyToken } = require('./middleware/auth');
 
 // Initialize Firebase Admin
@@ -44,6 +46,7 @@ app.use(express.json());
 
 // Mount Routes
 app.use('/api/users', userRoutes);
+app.use('/api/email-reports', emailReportRoutes);
 
 // Root Health Check
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Rice Mill Server is running' }));
@@ -422,7 +425,18 @@ cron.schedule('0 0 * * *', async () => {
       }
     }
 
-    // 3. Cleanup: Delete data older than 2 days
+    // 3. Automated Daily Email Export for connected users
+    try {
+      const emailSettings = await UserSettings.find({ isEmailReportEnabled: true });
+      console.log(`✉️ Running daily email reports for ${emailSettings.length} users...`);
+      for (const settings of emailSettings) {
+        await processDailyEmailExport(settings.userEmail, yesterday);
+      }
+    } catch (emailErr) {
+      console.error('❌ Error during daily email cron export:', emailErr.message);
+    }
+
+    // 4. Cleanup: Delete data older than 2 days
     const cleanupDate = new Date();
     cleanupDate.setDate(cleanupDate.getDate() - 2);
     const resultMeter = await MeterData.deleteMany({ timestamp: { $lt: cleanupDate } });

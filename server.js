@@ -105,7 +105,7 @@ mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
   .catch(err => console.error('MongoDB connection error:', err));
 
 // MQTT Setup
-const MQTT_BROKER = 'mqtt://broker.emqx.io:1883';
+const MQTT_BROKER = 'mqtt://13.233.76.8:1883';
 const MQTT_TOPICS = ['EMS1/data', 'EMS/+/data', 'APFC1/data', 'APFCtst/data'];
 const mqttClient = mqtt.connect(MQTT_BROKER);
 

@@ -35,6 +35,7 @@ const meterDataSchema = new mongoose.Schema({
   Freq: Number,
   IN: Number,
   status: { type: String, default: 'online' },
+  capacitors: mongoose.Schema.Types.Mixed,
   timestamp: { type: Date, default: Date.now }
 });
 

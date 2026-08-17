@@ -13,6 +13,8 @@ const UserSettings = require('./models/UserSettings');
 const Notification = require('./models/Notification');
 const DeviceToken = require('./models/DeviceToken');
 const User = require('./models/User');
+const Device = require('./models/Device');
+const CapacitorState = require('./models/CapacitorState');
 const admin = require('firebase-admin');
 
 // Routes
@@ -106,7 +108,7 @@ mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
 
 // MQTT Setup
 const MQTT_BROKER = 'mqtt://13.233.76.8:1883';
-const MQTT_TOPICS = ['EMS1/data', 'EMS/+/data', 'APFC1/data', 'APFCtst/data'];
+const MQTT_TOPICS = ['EMS1/data', 'EMS/+/data', 'APFC1/data', 'APFCtst/data', 'APFC/+/data'];
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
 mqttClient.on('connect', () => {
@@ -139,6 +141,9 @@ mqttClient.on('message', async (topic, message) => {
     deviceId = 'APFC_v1';
   } else if (topic.startsWith('EMS/') && topic.endsWith('/data')) {
     // Pattern: EMS/DEVICE_ID/data
+    deviceId = topic.split('/')[1];
+  } else if (topic.startsWith('APFC/') && topic.endsWith('/data')) {
+    // Pattern: APFC/DEVICE_ID/data
     deviceId = topic.split('/')[1];
   }
 
@@ -180,6 +185,9 @@ mqttClient.on('message', async (topic, message) => {
       if (payload.ImportVAh !== undefined) {
         payload.KVAH = payload.ImportVAh;
       }
+      if (payload.IR !== undefined) payload.I1 = payload.IR;
+      if (payload.IY !== undefined) payload.I2 = payload.IY;
+      if (payload.IB !== undefined) payload.I3 = payload.IB;
 
       // Map incoming fields to schema fields (Old Format Support)
       if (payload.KW1 !== undefined) {
@@ -204,9 +212,60 @@ mqttClient.on('message', async (topic, message) => {
         payload.Freq = payload.F;
       }
 
+      // Process Capacitor Statuses (S1 through S12)
+      const capacitorKeys = ['S1','S2','S3','S4','S5','S6','S7','S8','S9','S10','S11','S12'];
+      const incomingTimestamp = payload.Timestamp ? new Date(payload.Timestamp) : new Date();
+      const hasCapacitorsInPayload = capacitorKeys.some(k => payload[k] !== undefined);
+      let currentCapacitorStatesMap = {};
+
+      if (hasCapacitorsInPayload) {
+        for (const key of capacitorKeys) {
+          if (payload[key] !== undefined) {
+            const boolStatus = Boolean(payload[key]);
+            let capDoc = await CapacitorState.findOne({ deviceId, capacitorKey: key });
+            if (!capDoc) {
+              capDoc = new CapacitorState({
+                deviceId,
+                capacitorKey: key,
+                status: boolStatus,
+                lastChanged: incomingTimestamp,
+                history: [{ status: boolStatus, timestamp: incomingTimestamp }]
+              });
+              await capDoc.save();
+            } else if (capDoc.status !== boolStatus) {
+              capDoc.status = boolStatus;
+              capDoc.lastChanged = incomingTimestamp;
+              capDoc.history.push({ status: boolStatus, timestamp: incomingTimestamp });
+              await capDoc.save();
+              console.log(`🔌 [Capacitor Changed] ${deviceId} ${key} -> ${boolStatus} at ${incomingTimestamp.toISOString()}`);
+            }
+
+            currentCapacitorStatesMap[key] = {
+              status: capDoc.status,
+              lastChanged: capDoc.lastChanged
+            };
+          }
+        }
+      } else {
+        const existingCaps = await CapacitorState.find({ deviceId });
+        for (const doc of existingCaps) {
+          currentCapacitorStatesMap[doc.capacitorKey] = {
+            status: doc.status,
+            lastChanged: doc.lastChanged
+          };
+        }
+      }
+
+      const deviceDoc = await Device.findOne({ deviceId });
+      const capacitorCount = deviceDoc ? (deviceDoc.capacitorCount || 10) : 10;
+      const deviceType = deviceDoc ? (deviceDoc.deviceType || 'EMS') : 'EMS';
+
+      payload.capacitors = currentCapacitorStatesMap;
+      payload.capacitorCount = capacitorCount;
+      payload.deviceType = deviceType;
       payload.deviceId = deviceId;
       payload.status = currentStatus;
-      payload.timestamp = new Date();
+      payload.timestamp = incomingTimestamp;
 
       const now = Date.now();
       const lastSaveTime = lastSaveTimes.get(deviceId) || 0;
@@ -215,7 +274,6 @@ mqttClient.on('message', async (topic, message) => {
         const newData = new MeterData(payload);
         await newData.save();
         lastSaveTimes.set(deviceId, now);
-        // console.log(`💾 Data saved to MongoDB for ${deviceId}: KW=${payload.KW?.toFixed(2)}, KVA=${payload.KVA?.toFixed(2)}, PF=${payload.PF?.toFixed(3)}, KWH=${payload.KWH}`);
       }
 
       // Emit data over WebSockets to specific device room
@@ -542,8 +600,25 @@ app.get('/api/status', async (req, res) => {
   try {
     const { deviceId } = req.query;
     const query = deviceId ? { deviceId } : {};
-    const latest = await MeterData.findOne(query).sort({ timestamp: -1 });
-    if (!latest) return res.status(404).json({ error: 'No data found' });
+    const latestDoc = await MeterData.findOne(query).sort({ timestamp: -1 });
+    if (!latestDoc) return res.status(404).json({ error: 'No data found' });
+    const latest = latestDoc.toObject();
+
+    if (latest.deviceId) {
+      const existingCaps = await CapacitorState.find({ deviceId: latest.deviceId });
+      const capsMap = {};
+      for (const doc of existingCaps) {
+        capsMap[doc.capacitorKey] = {
+          status: doc.status,
+          lastChanged: doc.lastChanged
+        };
+      }
+      latest.capacitors = capsMap;
+      const deviceDoc = await Device.findOne({ deviceId: latest.deviceId });
+      latest.capacitorCount = deviceDoc ? (deviceDoc.capacitorCount || 10) : 10;
+      latest.deviceType = deviceDoc ? (deviceDoc.deviceType || 'EMS') : 'EMS';
+    }
+
     res.json(latest);
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
+const Device = require('../models/Device');
 const DeviceToken = require('../models/DeviceToken');
 const admin = require('firebase-admin');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
@@ -111,19 +112,42 @@ async function getHierarchicalUser(email) {
   if (!user.isSharedUser) {
     userObj.subUsers = await User.find({ mainUserEmail: user.email });
   }
+  if (userObj.assignedDevices && userObj.assignedDevices.length > 0) {
+    const devicesMeta = await Device.find({ deviceId: { $in: userObj.assignedDevices } });
+    const devMap = {};
+    devicesMeta.forEach(d => {
+      devMap[d.deviceId] = {
+        deviceName: d.deviceName || 'Rice Mill',
+        capacitorCount: d.capacitorCount !== undefined ? d.capacitorCount : 10,
+        isActive: d.isActive !== undefined ? d.isActive : true,
+        deviceType: d.deviceType || 'EMS'
+      };
+    });
+    userObj.deviceConfigs = userObj.assignedDevices.map(id => ({
+      deviceId: id,
+      deviceName: devMap[id] ? devMap[id].deviceName : 'Rice Mill',
+      capacitorCount: devMap[id] ? devMap[id].capacitorCount : 10,
+      isActive: devMap[id] ? devMap[id].isActive : true,
+      deviceType: devMap[id] ? devMap[id].deviceType : 'EMS'
+    }));
+  } else {
+    userObj.deviceConfigs = [];
+  }
   return userObj;
 }
 
 // Admin Route: Register a new user
 router.post('/register', async (req, res) => {
   try {
-    const { name, phone, email, deviceId, millName } = req.body;
+    const { name, phone, email, deviceId, millName, capacitorCount, deviceType } = req.body;
     let normalizedEmail = email.toLowerCase();
     
     let user = await User.findOne({ email: normalizedEmail });
     if (user) {
       return res.status(400).json({ message: 'A user with this email already exists in the system.' });
     }
+
+    const trimmedDevId = deviceId ? deviceId.trim() : '';
 
     user = new User({
       uid: normalizedEmail, // Temporary UID until they sign in
@@ -132,14 +156,44 @@ router.post('/register', async (req, res) => {
       email: normalizedEmail,
       role: 'User',
       millName: millName || '',
-      assignedDevices: deviceId ? [deviceId] : []
+      assignedDevices: trimmedDevId ? [trimmedDevId] : []
     });
     await user.save();
+
+    if (trimmedDevId) {
+      const capsCount = parseInt(capacitorCount, 10) || 10;
+      const devType = deviceType === 'APFC' ? 'APFC' : 'EMS';
+      await Device.findOneAndUpdate(
+        { deviceId: trimmedDevId },
+        { $set: { capacitorCount: capsCount, deviceType: devType } },
+        { upsert: true, returnDocument: 'after' }
+      );
+    }
     
     const updatedUser = await getHierarchicalUser(normalizedEmail);
     res.status(201).json({ message: 'User registered successfully', user: updatedUser });
   } catch (error) {
     res.status(500).json({ message: 'Error registering user' });
+  }
+});
+
+// Admin Route: Update device config (such as capacitor count)
+router.put('/devices/:deviceId/config', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { capacitorCount } = req.body;
+    const count = parseInt(capacitorCount, 10);
+    if (isNaN(count) || count < 1 || count > 12) {
+      return res.status(400).json({ error: 'Capacitor count must be between 1 and 12' });
+    }
+    const device = await Device.findOneAndUpdate(
+      { deviceId: deviceId.trim() },
+      { $set: { capacitorCount: count } },
+      { upsert: true, returnDocument: 'after' }
+    );
+    res.json({ message: 'Device configuration updated', device });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -161,11 +215,22 @@ router.get('/', async (req, res) => {
     const sharedUsers = allUsers.filter(u => u.isSharedUser);
 
     // 3. Nest Shared Users under their respective Owners
-    const hierarchicalData = owners.map(owner => {
+    const hierarchicalData = await Promise.all(owners.map(async owner => {
       const ownerObj = owner.toObject();
       ownerObj.subUsers = sharedUsers.filter(u => u.mainUserEmail === owner.email);
+      if (ownerObj.assignedDevices && ownerObj.assignedDevices.length > 0) {
+        const devicesMeta = await Device.find({ deviceId: { $in: ownerObj.assignedDevices } });
+        const devMap = {};
+        devicesMeta.forEach(d => { devMap[d.deviceId] = d.capacitorCount !== undefined ? d.capacitorCount : 10; });
+        ownerObj.deviceConfigs = ownerObj.assignedDevices.map(id => ({
+          deviceId: id,
+          capacitorCount: devMap[id] !== undefined ? devMap[id] : 10
+        }));
+      } else {
+        ownerObj.deviceConfigs = [];
+      }
       return ownerObj;
-    });
+    }));
 
     res.json(hierarchicalData);
   } catch (err) {
@@ -190,6 +255,8 @@ router.post('/:email/devices', async (req, res) => {
   try {
     const { email } = req.params;
     const deviceId = req.body.deviceId ? req.body.deviceId.trim() : '';
+    const capacitorCount = req.body.capacitorCount ? parseInt(req.body.capacitorCount, 10) : 10;
+    const deviceType = req.body.deviceType === 'APFC' ? 'APFC' : 'EMS';
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
 
     let user = await User.findOne({ email: email.toLowerCase() });
@@ -200,6 +267,13 @@ router.post('/:email/devices', async (req, res) => {
       user.assignedDevices.push(deviceId);
       modified = true;
     }
+
+    // Save capacitor count & deviceType for device
+    await Device.findOneAndUpdate(
+      { deviceId },
+      { $set: { capacitorCount, deviceType } },
+      { upsert: true, returnDocument: 'after' }
+    );
 
     // If access was previously revoked, clear it now that a device is assigned
     if (user.accessRevoked) {
@@ -214,6 +288,71 @@ router.post('/:email/devices', async (req, res) => {
     const updatedUser = await getHierarchicalUser(email);
     res.json({ message: 'Device added successfully', user: updatedUser });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin Route: Edit details of an assigned device (ID, name, capacitorCount, isActive, deviceType)
+router.put('/:email/devices/:oldDeviceId', async (req, res) => {
+  try {
+    const { email, oldDeviceId } = req.params;
+    const { newDeviceId, deviceName, capacitorCount, isActive, deviceType } = req.body;
+    const trimmedOldId = oldDeviceId.trim();
+    const trimmedNewId = newDeviceId ? newDeviceId.trim() : trimmedOldId;
+
+    let user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // 1. If device ID is being renamed
+    if (trimmedNewId !== trimmedOldId) {
+      // Update in owner's assignedDevices
+      user.assignedDevices = user.assignedDevices.map(id => id.trim() === trimmedOldId ? trimmedNewId : id);
+      await user.save();
+
+      // Update in any other users (e.g. shared users)
+      await User.updateMany(
+        { assignedDevices: trimmedOldId },
+        { $set: { "assignedDevices.$": trimmedNewId } }
+      );
+
+      // Update Device model
+      await Device.updateMany(
+        { deviceId: trimmedOldId },
+        { $set: { deviceId: trimmedNewId } }
+      );
+
+      // Update MeterData model
+      const MeterData = require('../models/MeterData');
+      await MeterData.updateMany(
+        { deviceId: trimmedOldId },
+        { $set: { deviceId: trimmedNewId } }
+      );
+
+      // Update CapacitorState model
+      const CapacitorState = require('../models/CapacitorState');
+      await CapacitorState.updateMany(
+        { deviceId: trimmedOldId },
+        { $set: { deviceId: trimmedNewId } }
+      );
+    }
+
+    // 2. Update Device settings (name, capacitorCount, isActive, deviceType)
+    const updates = {};
+    if (deviceName !== undefined) updates.deviceName = deviceName;
+    if (capacitorCount !== undefined) updates.capacitorCount = parseInt(capacitorCount, 10);
+    if (isActive !== undefined) updates.isActive = Boolean(isActive);
+    if (deviceType !== undefined) updates.deviceType = deviceType === 'APFC' ? 'APFC' : 'EMS';
+
+    await Device.findOneAndUpdate(
+      { deviceId: trimmedNewId },
+      { $set: updates },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    const updatedUser = await getHierarchicalUser(email);
+    res.json({ message: 'Device details updated successfully', user: updatedUser });
+  } catch (err) {
+    console.error('Error updating device details:', err);
     res.status(500).json({ error: err.message });
   }
 });

@@ -5,7 +5,7 @@ const notificationSchema = new mongoose.Schema({
   userEmail: { type: String, required: true, index: true },
   title: { type: String, required: true },
   message: { type: String, required: true },
-  type: { type: String, enum: ['CMD', 'POWER', 'PF', 'INFO'], default: 'INFO' },
+  type: { type: String, enum: ['CMD', 'POWER', 'PF', 'INFO', 'TEST'], default: 'INFO' },
   timestamp: { type: Date, default: Date.now },
   read: { type: Boolean, default: false }
 });

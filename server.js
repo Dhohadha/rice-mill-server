@@ -149,7 +149,17 @@ mqttClient.on('message', async (topic, message) => {
 
   if (deviceId) {
     try {
-      const payload = JSON.parse(message.toString());
+      const rawStr = message.toString().trim();
+      if (!rawStr) return;
+
+      let payload;
+      try {
+        payload = JSON.parse(rawStr);
+      } catch (parseErr) {
+        return; // Ignore empty or invalid JSON payloads
+      }
+
+      if (!payload || typeof payload !== 'object') return;
       if (payload.status === "no_data") return; 
       
       const previousStatus = deviceStatuses.get(deviceId) || 'online';
@@ -291,21 +301,28 @@ mqttClient.on('message', async (topic, message) => {
             await settings.save();
           }
 
+          const pfVal = payload.PF != null ? Number(payload.PF) : null;
+          const pfLimitVal = (settings && settings.pfLimit != null) ? Number(settings.pfLimit) : null;
+          const kvaVal = payload.KVA != null ? Number(payload.KVA) : null;
+          const kwVal = payload.KW != null ? Number(payload.KW) : null;
+          const cmdLimitVal = (settings && settings.cmdLimit != null) ? Number(settings.cmdLimit) : null;
+          const powerLimitVal = (settings && settings.powerLimit != null) ? Number(settings.powerLimit) : null;
+
           const alertsToCheck = [
             {
               type: 'CMD',
-              isBreached: payload.KVA && payload.KVA > settings.cmdLimit,
-              msg: `CMD Alert: Current kVA (${payload.KVA}) exceeded limit (${settings.cmdLimit})!`
+              isBreached: Boolean(kvaVal != null && cmdLimitVal != null && kvaVal > cmdLimitVal),
+              msg: `CMD Alert: Current kVA (${kvaVal}) exceeded limit (${cmdLimitVal})!`
             },
             {
               type: 'POWER',
-              isBreached: payload.KW && payload.KW > settings.powerLimit,
-              msg: `POWER Alert: Current kW (${payload.KW}) exceeded limit (${settings.powerLimit})!`
+              isBreached: Boolean(kwVal != null && powerLimitVal != null && kwVal > powerLimitVal),
+              msg: `POWER Alert: Current kW (${kwVal}) exceeded limit (${powerLimitVal})!`
             },
             {
               type: 'PF',
-              isBreached: payload.KVA && payload.KVA >= 10 && payload.KW && payload.KW >= 10 && payload.PF && payload.PF < settings.pfLimit,
-              msg: `PF Alert: Current PF (${payload.PF.toFixed(3)}) fell below limit (${settings.pfLimit.toFixed(2)})!`
+              isBreached: Boolean(kvaVal != null && kvaVal >= 10 && kwVal != null && kwVal >= 10 && pfVal != null && pfLimitVal != null && pfVal < pfLimitVal),
+              msg: `PF Alert: Current PF (${pfVal != null ? pfVal.toFixed(3) : 'N/A'}) fell below limit (${pfLimitVal != null ? pfLimitVal.toFixed(2) : 'N/A'})!`
             }
           ];
 
@@ -769,27 +786,90 @@ app.post('/api/stop-alert', async (req, res) => {
   }
 });
 
-// Test Notification Route
-app.post('/api/test-notification', async (req, res) => {
+// Test Notification Route (Supports token or email)
+app.post(['/api/test-notification', '/api/test-notification-by-email'], async (req, res) => {
   try {
-    const { token, title, message } = req.body;
-    if (!token) return res.status(400).json({ error: 'Token is required' });
+    const { token, email, userEmail, title, message, deviceId } = req.body;
+    const targetEmail = (email || userEmail || '').trim().toLowerCase();
 
-    const payload = {
-      data: {
-        title: title || 'Test Notification',
-        body: message || 'This is a test notification from the server',
-        alertId: `TEST_${Date.now()}`,
-      },
-      token: token,
-      android: {
-        priority: 'high',
-      },
-    };
+    const notifTitle = title || 'Test Notification';
+    const notifBody = message || 'This is a test notification from the server';
+    const alertId = `TEST_${Date.now()}`;
 
-    const response = await admin.messaging().send(payload);
-    console.log('✅ Test notification sent successfully:', response);
-    res.json({ success: true, messageId: response });
+    // Collect target FCM tokens
+    let tokens = [];
+
+    if (token) {
+      tokens.push(token);
+    }
+
+    if (targetEmail) {
+      const deviceTokens = await DeviceToken.find({ userEmail: targetEmail });
+      deviceTokens.forEach(t => {
+        if (t.token && !tokens.includes(t.token)) {
+          tokens.push(t.token);
+        }
+      });
+
+      // Fallback to User.fcmToken if no tokens found in DeviceToken collection
+      if (tokens.length === 0) {
+        const userDoc = await User.findOne({ email: targetEmail });
+        if (userDoc && userDoc.fcmToken && !tokens.includes(userDoc.fcmToken)) {
+          tokens.push(userDoc.fcmToken);
+        }
+      }
+
+      // Save notification to DB history if email is provided
+      await new Notification({
+        deviceId: deviceId || 'TEST_DEVICE',
+        title: notifTitle,
+        message: notifBody,
+        type: 'TEST',
+        userEmail: targetEmail
+      }).save();
+    }
+
+    if (!token && !targetEmail) {
+      return res.status(400).json({ error: 'Either "email" or "token" is required in request body.' });
+    }
+
+    if (tokens.length === 0) {
+      return res.status(404).json({ error: `No registered device FCM token found for email: ${targetEmail}` });
+    }
+
+    // Send push notification(s)
+    let sendResult;
+    if (tokens.length === 1) {
+      const payload = {
+        data: {
+          title: notifTitle,
+          body: notifBody,
+          alertId: alertId,
+        },
+        token: tokens[0],
+        android: { priority: 'high' },
+      };
+      sendResult = await admin.messaging().send(payload);
+    } else {
+      const payload = {
+        data: {
+          title: notifTitle,
+          body: notifBody,
+          alertId: alertId,
+        },
+        tokens: tokens,
+        android: { priority: 'high' },
+      };
+      sendResult = await admin.messaging().sendEachForMulticast(payload);
+    }
+
+    console.log(`✅ Test notification sent successfully to ${targetEmail || token}:`, sendResult);
+    res.json({
+      success: true,
+      recipient: targetEmail || token,
+      tokensCount: tokens.length,
+      result: sendResult
+    });
   } catch (err) {
     console.error('❌ Test notification error:', err.message);
     res.status(500).json({ error: err.message });

@@ -66,6 +66,13 @@ router.post('/sync', verifyToken, async (req, res) => {
       if (mainUser) {
         userObj.millName = mainUser.millName;
       }
+    } else if ((!user.millName || user.millName.trim().isEmpty) && user.assignedDevices && user.assignedDevices.length > 0) {
+      const dev = await Device.findOne({ deviceId: user.assignedDevices[0] });
+      if (dev && dev.deviceName) {
+        user.millName = dev.deviceName;
+        await user.save();
+        userObj.millName = dev.deviceName;
+      }
     }
     res.json({ ...userObj, isRegistered: true });
   } catch (err) {
@@ -77,8 +84,17 @@ router.post('/sync', verifyToken, async (req, res) => {
 // Authenticated Route: Update self profile (name, phone, millName)
 router.put('/profile/update', verifyToken, async (req, res) => {
   try {
-    const user = await User.findOne({ uid: req.user.uid });
+    const user = await User.findOne({
+      $or: [
+        { uid: req.user.uid },
+        { email: req.user.email ? req.user.email.toLowerCase() : '' }
+      ]
+    });
     if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (req.user.uid && user.uid !== req.user.uid) {
+      user.uid = req.user.uid;
+    }
 
     const { name, phone, millName } = req.body;
     if (name) user.name = name;
@@ -86,6 +102,12 @@ router.put('/profile/update', verifyToken, async (req, res) => {
     // Only allow updating millName if not a shared user (shared users inherit the owner's millName)
     if (millName !== undefined && !user.isSharedUser) {
       user.millName = millName;
+      if (user.assignedDevices && user.assignedDevices.length > 0) {
+        await Device.updateMany(
+          { deviceId: { $in: user.assignedDevices } },
+          { $set: { deviceName: millName } }
+        );
+      }
     }
 
     await user.save();
@@ -100,6 +122,7 @@ router.put('/profile/update', verifyToken, async (req, res) => {
     }
     res.json({ message: 'Profile updated successfully', user: userObj });
   } catch (err) {
+    console.error('Error updating profile:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -348,6 +371,11 @@ router.put('/:email/devices/:oldDeviceId', async (req, res) => {
       { $set: updates },
       { upsert: true, returnDocument: 'after' }
     );
+
+    if (deviceName !== undefined && user && !user.isSharedUser) {
+      user.millName = deviceName;
+      await user.save();
+    }
 
     const updatedUser = await getHierarchicalUser(email);
     res.json({ message: 'Device details updated successfully', user: updatedUser });

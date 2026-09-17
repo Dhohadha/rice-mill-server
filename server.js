@@ -861,11 +861,26 @@ app.post(['/api/test-notification', '/api/test-notification-by-email'], async (r
         android: { priority: 'high' },
       };
       sendResult = await admin.messaging().sendEachForMulticast(payload);
+      
+      // Cleanup invalid / unregistered tokens from DB
+      if (sendResult.failureCount > 0) {
+        const failedTokens = [];
+        sendResult.responses.forEach((resp, idx) => {
+          if (!resp.success) {
+            console.error(`⚠️ FCM failure for token [${tokens[idx].substring(0, 12)}...]:`, resp.error?.code || resp.error?.message);
+            failedTokens.push(tokens[idx]);
+          }
+        });
+        if (failedTokens.length > 0) {
+          await DeviceToken.deleteMany({ token: { $in: failedTokens } });
+          console.log(`🧹 Pruned ${failedTokens.length} expired FCM token(s) from database for ${targetEmail}`);
+        }
+      }
     }
 
-    console.log(`✅ Test notification sent successfully to ${targetEmail || token}:`, sendResult);
+    console.log(`📲 Test notification sent to ${targetEmail || token}: ${sendResult?.successCount ?? 1} success, ${sendResult?.failureCount ?? 0} failure`);
     res.json({
-      success: true,
+      success: (sendResult?.successCount ?? 1) > 0,
       recipient: targetEmail || token,
       tokensCount: tokens.length,
       result: sendResult

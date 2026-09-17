@@ -156,19 +156,46 @@ mqttClient.on('message', async (topic, message) => {
       try {
         payload = JSON.parse(rawStr);
       } catch (parseErr) {
-        return; // Ignore empty or invalid JSON payloads
+        if (rawStr === '226' || rawStr.includes('226')) {
+          payload = { status: 'error', error: 226 };
+        } else {
+          return; // Ignore empty or invalid JSON payloads
+        }
+      }
+
+      if (typeof payload === 'number' && payload === 226) {
+        payload = { status: 'error', error: 226 };
       }
 
       if (!payload || typeof payload !== 'object') return;
       if (payload.status === "no_data") return; 
-      
+
+      // Detect Error 226 (Power Off / MCCB Tripped)
+      const isError226 = Boolean(
+        payload.error === 226 ||
+        payload.error === '226' ||
+        payload.err === 226 ||
+        payload.err === '226' ||
+        payload.code === 226 ||
+        payload.code === '226' ||
+        payload.errorCode === 226 ||
+        payload.errorCode === '226' ||
+        payload.status === 226 ||
+        payload.status === '226' ||
+        payload.Error === 226 ||
+        payload.Error === '226' ||
+        payload.Err === 226 ||
+        payload.Err === '226' ||
+        (payload.status === 'error' && (payload.error == 226 || payload.err == 226 || payload.code == 226 || payload.errorCode == 226 || payload.message == '226' || payload.msg == '226'))
+      );
+
       const previousStatus = deviceStatuses.get(deviceId) || 'online';
-      const currentStatus = payload.status === 'error' ? 'offline' : 'online';
+      const currentStatus = (payload.status === 'error' || isError226) ? 'offline' : 'online';
       let statusChanged = false;
 
       if (currentStatus !== previousStatus) {
         if (currentStatus === 'offline') {
-          console.log(`📡 [STATUS] Device ${deviceId} went OFFLINE`);
+          console.log(`📡 [STATUS] Device ${deviceId} went OFFLINE${isError226 ? ' (Error 226: APFC Panel Power off/MCCB Tripped)' : ''}`);
         } else {
           console.log(`📡 [STATUS] Device ${deviceId} came ONLINE`);
         }
@@ -276,6 +303,10 @@ mqttClient.on('message', async (topic, message) => {
       payload.deviceId = deviceId;
       payload.status = currentStatus;
       payload.timestamp = incomingTimestamp;
+      if (isError226) {
+        payload.errorCode = 226;
+        payload.errorMessage = 'APFC Panel Power off/MCCB Tripped';
+      }
 
       const now = Date.now();
       const lastSaveTime = lastSaveTimes.get(deviceId) || 0;
@@ -288,6 +319,74 @@ mqttClient.on('message', async (topic, message) => {
 
       // Emit data over WebSockets to specific device room
       io.to(payload.deviceId).emit('meterData', payload);
+
+      // Handle Error 226 (Power Off / MCCB Tripped Alert)
+      if (isError226) {
+        const User = require('./models/User');
+        const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });
+        
+        for (const user of usersWithAccess) {
+          const normalizedEmail = user.email.toLowerCase();
+          
+          // Prevent spamming the same user with the same power off alert within 3 minutes
+          const recentAlert = await Notification.findOne({
+            type: 'POWER_OFF',
+            deviceId: payload.deviceId,
+            userEmail: normalizedEmail,
+            timestamp: { $gte: new Date(Date.now() - 3 * 60 * 1000) }
+          });
+
+          if (!recentAlert) {
+            console.log(`🚨 [Trip Alert] Triggering Power Off / MCCB Tripped alert for ${user.email} (Device: ${payload.deviceId})`);
+            
+            await new Notification({ 
+              deviceId: payload.deviceId,
+              title: `Power Off / Trip Alert`, 
+              message: `APFC Panel Power off/MCCB Tripped`, 
+              type: 'POWER_OFF',
+              userEmail: normalizedEmail 
+            }).save();
+            
+            // Send FCM push notifications to THIS user specifically
+            try {
+              const tokens = await DeviceToken.find({ userEmail: normalizedEmail });
+              const registrationTokens = tokens.map(t => t.token);
+
+              if (registrationTokens.length > 0) {
+                const fcmMessage = {
+                  data: {
+                    title: `⚠️ Alert: ${payload.deviceId}`,
+                    body: `APFC Panel Power off/MCCB Tripped`,
+                    alertId: `POWER_OFF_${Date.now()}`,
+                    deviceId: payload.deviceId,
+                    type: 'POWER_OFF',
+                  },
+                  tokens: registrationTokens,
+                  android: {
+                    priority: 'high',
+                  },
+                };
+
+                const response = await admin.messaging().sendEachForMulticast(fcmMessage);
+                console.log(`📲 Successfully sent ${response.successCount} trip push notifications to ${user.email}`);
+                
+                // Cleanup invalid tokens
+                if (response.failureCount > 0) {
+                  const failedTokens = [];
+                  response.responses.forEach((resp, idx) => {
+                    if (!resp.success) failedTokens.push(registrationTokens[idx]);
+                  });
+                  if (failedTokens.length > 0) {
+                    await DeviceToken.deleteMany({ token: { $in: failedTokens } });
+                  }
+                }
+              }
+            } catch (fcmErr) {
+              console.error(`❌ FCM Send Error for ${user.email}:`, fcmErr.message);
+            }
+          }
+        }
+      }
 
       if (currentStatus === 'online') {
         // Alert Check (Per User)
@@ -354,7 +453,7 @@ mqttClient.on('message', async (topic, message) => {
             const recentAlert = await Notification.findOne({
               type: alert.type,
               userEmail: user.email, // We should add userEmail to Notification model too
-              timestamp: { $gte: new Date(Date.now() - 5 * 60 * 700) }
+              timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
             });
             
             if (!recentAlert) {

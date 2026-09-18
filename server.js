@@ -172,21 +172,25 @@ mqttClient.on('message', async (topic, message) => {
 
       // Detect Error 226 (Power Off / MCCB Tripped)
       const isError226 = Boolean(
-        payload.error === 226 ||
-        payload.error === '226' ||
-        payload.err === 226 ||
-        payload.err === '226' ||
+        payload.Code === 226 ||
+        payload.Code === '226' ||
         payload.code === 226 ||
         payload.code === '226' ||
-        payload.errorCode === 226 ||
-        payload.errorCode === '226' ||
-        payload.status === 226 ||
-        payload.status === '226' ||
+        payload.error === 226 ||
+        payload.error === '226' ||
         payload.Error === 226 ||
         payload.Error === '226' ||
+        payload.errorCode === 226 ||
+        payload.errorCode === '226' ||
+        payload.ErrorCode === 226 ||
+        payload.ErrorCode === '226' ||
+        payload.err === 226 ||
+        payload.err === '226' ||
         payload.Err === 226 ||
         payload.Err === '226' ||
-        (payload.status === 'error' && (payload.error == 226 || payload.err == 226 || payload.code == 226 || payload.errorCode == 226 || payload.message == '226' || payload.msg == '226'))
+        payload.status === 226 ||
+        payload.status === '226' ||
+        (payload.status === 'error' && (payload.error == 226 || payload.err == 226 || payload.code == 226 || payload.Code == 226 || payload.errorCode == 226 || payload.ErrorCode == 226 || payload.message == '226' || payload.msg == '226'))
       );
 
       const previousStatus = deviceStatuses.get(deviceId) || 'online';
@@ -204,6 +208,12 @@ mqttClient.on('message', async (topic, message) => {
       }
 
       // Map incoming fields to schema fields (New Format Support)
+      if (payload.MeterID !== undefined) {
+        payload.meterId = payload.MeterID;
+      }
+      if (payload.Code !== undefined) {
+        payload.errorCode = payload.Code;
+      }
       if (payload.TotalKW !== undefined) {
         payload.KW = payload.TotalKW / 1000;
       }

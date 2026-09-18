@@ -123,6 +123,7 @@ mqttClient.on('connect', () => {
 const lastSaveTimes = new Map();
 const SAVE_INTERVAL = 60 * 700; // 1 minute
 const deviceStatuses = new Map(); // Track online/offline status
+const deviceTrippedStates = new Map(); // Track power-off/trip state: alert ONCE per trip until power recovers
 
 // Consecutive breach counters to prevent transient spikes
 // Key structure: `${userEmail}_${deviceId}_${alertType}`
@@ -331,23 +332,20 @@ mqttClient.on('message', async (topic, message) => {
       io.to(payload.deviceId).emit('meterData', payload);
 
       // Handle Error 226 (Power Off / MCCB Tripped Alert)
+      // Trigger strictly ONCE per trip episode until power recovers
       if (isError226) {
-        const User = require('./models/User');
-        const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });
-        
-        for (const user of usersWithAccess) {
-          const normalizedEmail = user.email.toLowerCase();
-          
-          // Prevent spamming the same user with the same power off alert within 3 minutes
-          const recentAlert = await Notification.findOne({
-            type: 'POWER_OFF',
-            deviceId: payload.deviceId,
-            userEmail: normalizedEmail,
-            timestamp: { $gte: new Date(Date.now() - 3 * 60 * 1000) }
-          });
+        const isAlreadyTripped = deviceTrippedStates.get(deviceId);
+        if (!isAlreadyTripped) {
+          deviceTrippedStates.set(deviceId, true);
+          console.log(`🚨 [Trip Alert] Power Off / MCCB Tripped detected for device ${payload.deviceId}. Triggering alert once for this trip episode.`);
 
-          if (!recentAlert) {
-            console.log(`🚨 [Trip Alert] Triggering Power Off / MCCB Tripped alert for ${user.email} (Device: ${payload.deviceId})`);
+          const User = require('./models/User');
+          const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });
+          
+          for (const user of usersWithAccess) {
+            const normalizedEmail = user.email.toLowerCase();
+            
+            console.log(`🚨 [Trip Alert] Dispatching alert to ${user.email} (Device: ${payload.deviceId})`);
             
             await new Notification({ 
               deviceId: payload.deviceId,
@@ -399,6 +397,11 @@ mqttClient.on('message', async (topic, message) => {
       }
 
       if (currentStatus === 'online') {
+        // Reset tripped state upon power recovery
+        if (deviceTrippedStates.get(deviceId)) {
+          console.log(`🔌 [POWER RECOVERY] Device ${deviceId} power recovered / back ONLINE. Trip alert re-armed.`);
+          deviceTrippedStates.set(deviceId, false);
+        }
         // Alert Check (Per User)
         const User = require('./models/User');
         const usersWithAccess = await User.find({ assignedDevices: payload.deviceId });

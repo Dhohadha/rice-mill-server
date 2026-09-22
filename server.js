@@ -23,6 +23,45 @@ const emailReportRoutes = require('./routes/emailReportRoutes');
 const { processDailyEmailExport } = require('./services/emailService');
 const { verifyToken } = require('./middleware/auth');
 
+// IST Timezone Utilities (Asia/Kolkata / UTC+5:30)
+function getISTMidnight(date = new Date()) {
+  const istDateStr = new Date(date).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  return new Date(`${istDateStr}T00:00:00+05:30`);
+}
+
+function getISTEndOfDay(date = new Date()) {
+  const istDateStr = new Date(date).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  return new Date(`${istDateStr}T23:59:59.999+05:30`);
+}
+
+function getISTStartOfMonth(date = new Date()) {
+  const istDateStr = new Date(date).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const [year, month] = istDateStr.split('-');
+  return new Date(`${year}-${month}-01T00:00:00+05:30`);
+}
+
+function getISTHour(date) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    hour: 'numeric',
+    hour12: false
+  });
+  return parseInt(formatter.format(new Date(date)), 10) % 24;
+}
+
+function formatISTDateTime(date) {
+  return new Date(date).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+}
+
 // Initialize Firebase Admin
 try {
   const serviceAccount = require('./service_account_key.json');
@@ -100,6 +139,7 @@ mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
           }
         }
       }
+      await initDeviceStatuses();
     } catch (e) {
       console.log('⚠️  Note: Cleanup or migration failed:', e.message);
     }
@@ -121,9 +161,68 @@ mqttClient.on('connect', () => {
 
 // Throttle control for saving data (per device)
 const lastSaveTimes = new Map();
-const SAVE_INTERVAL = 60 * 700; // 1 minute
+const SAVE_INTERVAL = 60 * 1000; // 1 minute
 const deviceStatuses = new Map(); // Track online/offline status
 const deviceTrippedStates = new Map(); // Track power-off/trip state: alert ONCE per trip until power recovers
+const lastOnlineTimes = new Map(); // Track last known active online timestamp
+const offlineSinceTimes = new Map(); // Track exact timestamp when power went off / device went offline
+
+// Initialize device status and power-off history on startup
+async function initDeviceStatuses() {
+  try {
+    const devices = await MeterData.distinct('deviceId');
+    for (const dId of devices) {
+      const lastOnlineDoc = await MeterData.findOne({
+        deviceId: dId,
+        status: { $ne: 'offline' },
+        errorCode: { $ne: 226 }
+      }).sort({ timestamp: -1 }).lean();
+
+      if (lastOnlineDoc) {
+        lastOnlineTimes.set(dId, new Date(lastOnlineDoc.timestamp));
+      }
+
+      const latestDoc = await MeterData.findOne({ deviceId: dId }).sort({ timestamp: -1 }).lean();
+      if (latestDoc && (latestDoc.status === 'offline' || latestDoc.errorCode === 226)) {
+        deviceStatuses.set(dId, 'offline');
+        const powerOffTime = lastOnlineDoc ? new Date(lastOnlineDoc.timestamp) : new Date(latestDoc.timestamp);
+        offlineSinceTimes.set(dId, powerOffTime);
+      } else if (latestDoc) {
+        const timeDiff = Date.now() - new Date(latestDoc.timestamp).getTime();
+        if (timeDiff > 45000) {
+          deviceStatuses.set(dId, 'offline');
+          offlineSinceTimes.set(dId, new Date(latestDoc.timestamp));
+        } else {
+          deviceStatuses.set(dId, 'online');
+        }
+      }
+    }
+    console.log(`📡 [Status Tracker] Initialized states for ${devices.length} devices (IST Timezone Active)`);
+  } catch (e) {
+    console.log('⚠️ Error initializing device statuses:', e.message);
+  }
+}
+
+// Background Monitor: Detect silent offline (power cut where device sends nothing)
+setInterval(() => {
+  const now = Date.now();
+  for (const [deviceId, lastOnline] of lastOnlineTimes.entries()) {
+    if (now - lastOnline.getTime() > 45000) {
+      if (deviceStatuses.get(deviceId) !== 'offline') {
+        deviceStatuses.set(deviceId, 'offline');
+        offlineSinceTimes.set(deviceId, lastOnline);
+        console.log(`📡 [STATUS] Device ${deviceId} silently went OFFLINE (Power lost at ${lastOnline.toISOString()}, IST: ${formatISTDateTime(lastOnline)})`);
+        
+        io.to(deviceId).emit('meterData', {
+          deviceId,
+          status: 'offline',
+          timestamp: lastOnline,
+          errorMessage: 'Device Communication Lost / Power Off'
+        });
+      }
+    }
+  }
+}, 15000);
 
 // Consecutive breach counters to prevent transient spikes
 // Key structure: `${userEmail}_${deviceId}_${alertType}`
@@ -194,9 +293,24 @@ mqttClient.on('message', async (topic, message) => {
         (payload.status === 'error' && (payload.error == 226 || payload.err == 226 || payload.code == 226 || payload.Code == 226 || payload.errorCode == 226 || payload.ErrorCode == 226 || payload.message == '226' || payload.msg == '226'))
       );
 
+      const incomingTimestamp = payload.Timestamp ? new Date(payload.Timestamp) : new Date();
       const previousStatus = deviceStatuses.get(deviceId) || 'online';
       const currentStatus = (payload.status === 'error' || isError226) ? 'offline' : 'online';
       let statusChanged = false;
+
+      if (currentStatus === 'online') {
+        lastOnlineTimes.set(deviceId, incomingTimestamp);
+        offlineSinceTimes.delete(deviceId);
+        deviceStatuses.set(deviceId, 'online');
+        deviceTrippedStates.set(deviceId, false);
+      } else {
+        if (!offlineSinceTimes.has(deviceId)) {
+          const powerOffTime = lastOnlineTimes.get(deviceId) || incomingTimestamp;
+          offlineSinceTimes.set(deviceId, powerOffTime);
+          console.log(`⚡ [POWER OFF] Device ${deviceId} lost power at ${powerOffTime.toISOString()} (IST: ${formatISTDateTime(powerOffTime)})`);
+        }
+        deviceStatuses.set(deviceId, 'offline');
+      }
 
       if (currentStatus !== previousStatus) {
         if (currentStatus === 'offline') {
@@ -204,7 +318,6 @@ mqttClient.on('message', async (topic, message) => {
         } else {
           console.log(`📡 [STATUS] Device ${deviceId} came ONLINE`);
         }
-        deviceStatuses.set(deviceId, currentStatus);
         statusChanged = true;
       }
 
@@ -313,7 +426,9 @@ mqttClient.on('message', async (topic, message) => {
       payload.deviceType = deviceType;
       payload.deviceId = deviceId;
       payload.status = currentStatus;
-      payload.timestamp = incomingTimestamp;
+      payload.timestamp = currentStatus === 'offline'
+        ? (offlineSinceTimes.get(deviceId) || incomingTimestamp)
+        : incomingTimestamp;
       if (isError226) {
         payload.errorCode = 226;
         payload.errorMessage = 'APFC Panel Power off/MCCB Tripped';
@@ -526,18 +641,15 @@ mqttClient.on('message', async (topic, message) => {
   }
 });
 
-// Daily Cron Job (Midnight) to calculate total kWh consumed per device
+// Daily Cron Job (Midnight IST) to calculate total kWh consumed per device
 cron.schedule('0 0 * * *', async () => {
   try {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    yesterday.setHours(0, 0, 0, 0);
-
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const now = new Date();
+    const todayStart = getISTMidnight(now);
+    const yesterday = getISTMidnight(new Date(now.getTime() - 24 * 60 * 60 * 1000));
 
     const deviceIds = await MeterData.distinct('deviceId');
-    console.log(`⏰ Running midnight cron for ${deviceIds.length} devices...`);
+    console.log(`⏰ Running midnight IST cron for ${deviceIds.length} devices (Date: ${formatISTDateTime(yesterday)})...`);
 
     for (const deviceId of deviceIds) {
       // 1. Consumption calculation
@@ -610,7 +722,7 @@ cron.schedule('0 0 * * *', async () => {
           },
           { upsert: true }
         );
-        console.log(`✅ Daily summary [${deviceId}] for ${yesterday.toDateString()} saved.`);
+        console.log(`✅ Daily summary [${deviceId}] for ${formatISTDateTime(yesterday)} saved.`);
       }
     }
 
@@ -626,8 +738,7 @@ cron.schedule('0 0 * * *', async () => {
     }
 
     // 4. Cleanup: Delete data older than 2 days
-    const cleanupDate = new Date();
-    cleanupDate.setDate(cleanupDate.getDate() - 2);
+    const cleanupDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
     const resultMeter = await MeterData.deleteMany({ timestamp: { $lt: cleanupDate } });
     const resultCond = await CondensedData.deleteMany({ timestamp: { $lt: cleanupDate } });
     console.log(`🧹 Cleanup: Removed ${resultMeter.deletedCount} MeterData and ${resultCond.deletedCount} CondensedData records.`);
@@ -635,14 +746,12 @@ cron.schedule('0 0 * * *', async () => {
   } catch (err) {
     console.error('Error in cron job:', err);
   }
-});
+}, { timezone: 'Asia/Kolkata' });
 
 // Helper to calculate historical day stats on-the-fly (fallback for missing DailyUsage)
 async function calculateHistoricalDayStats(deviceId, date) {
-  const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(date);
-  end.setHours(23, 59, 59, 999);
+  const start = getISTMidnight(date);
+  const end = getISTEndOfDay(date);
 
   // console.log(`🔍 Calculating on-the-fly stats for ${deviceId} on ${start.toDateString()}...`);
 
@@ -733,8 +842,23 @@ app.get('/api/status', async (req, res) => {
     if (!latestDoc) return res.status(404).json({ error: 'No data found' });
     const latest = latestDoc.toObject();
 
-    if (latest.deviceId) {
-      const existingCaps = await CapacitorState.find({ deviceId: latest.deviceId });
+    const devId = latest.deviceId || deviceId;
+    if (devId) {
+      const lastOnline = lastOnlineTimes.get(devId);
+      const offlineSince = offlineSinceTimes.get(devId);
+      const now = Date.now();
+      const isSilentOffline = lastOnline && (now - new Date(lastOnline).getTime() > 45000);
+
+      if (latest.status === 'offline' || latest.errorCode === 226 || isSilentOffline) {
+        latest.status = 'offline';
+        if (offlineSince) {
+          latest.timestamp = offlineSince;
+        } else if (lastOnline) {
+          latest.timestamp = lastOnline;
+        }
+      }
+
+      const existingCaps = await CapacitorState.find({ deviceId: devId });
       const capsMap = {};
       for (const doc of existingCaps) {
         capsMap[doc.capacitorKey] = {
@@ -743,7 +867,7 @@ app.get('/api/status', async (req, res) => {
         };
       }
       latest.capacitors = capsMap;
-      const deviceDoc = await Device.findOne({ deviceId: latest.deviceId });
+      const deviceDoc = await Device.findOne({ deviceId: devId });
       latest.capacitorCount = deviceDoc ? (deviceDoc.capacitorCount || 10) : 10;
       latest.deviceType = deviceDoc ? (deviceDoc.deviceType || 'EMS') : 'EMS';
     }
@@ -1032,26 +1156,24 @@ app.get('/api/daily-usage', async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-// Helper to calculate live today usage
+// Helper to calculate live today usage in IST
 async function calculateTodayConsumption(deviceId) {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
+  const todayStart = getISTMidnight(new Date());
 
   // 1. Get the current latest reading
   const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
   if (!currentNow || !currentNow.KWH) {
-    // console.log(`📊 No current KWH reading found for ${deviceId}`);
     return 0;
   }
 
-  // 2. Get the baseline (last reading BEFORE today with a valid KWH > 0)
+  // 2. Get the baseline (last reading BEFORE today in IST with a valid KWH > 0)
   let baseline = await MeterData.findOne({ 
     deviceId, 
     timestamp: { $lt: todayStart },
     KWH: { $gt: 0 }
   }).sort({ timestamp: -1 }).lean();
 
-  // 3. Fallback: Earliest record from today with a valid KWH > 0
+  // 3. Fallback: Earliest record from today (IST) with a valid KWH > 0
   if (!baseline) {
     baseline = await MeterData.findOne({ 
       deviceId, 
@@ -1068,20 +1190,16 @@ async function calculateTodayConsumption(deviceId) {
       // Rollover: Meter reset or wrapped around
       todayConsumption = currentNow.KWH;
     }
-    // console.log(`📊 Today Consumption for ${deviceId}: ${todayConsumption.toFixed(2)} kWh (Baseline: ${baseline.KWH}, Current: ${currentNow.KWH})`);
   } else {
-    // console.log(`📊 Baseline not found or invalid for ${deviceId}. Baseline: ${JSON.stringify(baseline)}`);
-    // If no baseline at all, today's consumption is 0 until we get a second reading
     todayConsumption = 0;
   }
   
   return todayConsumption;
 }
 
-// Helper to calculate live today KVA consumption
+// Helper to calculate live today KVA consumption in IST
 async function calculateTodayKvaConsumption(deviceId) {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
+  const todayStart = getISTMidnight(new Date());
 
   const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
   if (!currentNow || !currentNow.KVAH) {
@@ -1189,12 +1307,9 @@ app.get('/api/analysis/period-stats', async (req, res) => {
     const { deviceId, fromDate, toDate } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
     
-    const start = fromDate ? new Date(fromDate) : new Date();
-    if (!fromDate) start.setHours(0, 0, 0, 0);
+    const start = fromDate ? new Date(fromDate) : getISTMidnight(new Date());
     const end = toDate ? new Date(toDate) : new Date();
-
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const todayStart = getISTMidnight(new Date());
 
     // 1. Get History from DailyUsage (up to yesterday)
     let historicalUsages = await DailyUsage.find({
@@ -1308,10 +1423,8 @@ app.get('/api/analysis/mixed-stats', async (req, res) => {
     if (!deviceIds) return res.status(400).json({ error: 'deviceIds are required' });
     if (!Array.isArray(deviceIds)) deviceIds = [deviceIds];
 
-    const start = fromDate ? new Date(fromDate) : new Date();
-    if (!fromDate) start.setHours(0, 0, 0, 0);
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const start = fromDate ? new Date(fromDate) : getISTMidnight(new Date());
+    const todayStart = getISTMidnight(new Date());
 
     let totalConsumed = 0;
     
@@ -1439,13 +1552,9 @@ app.get('/api/analysis/range-usage', async (req, res) => {
       return res.status(400).json({ error: 'deviceId, fromDate, and toDate are required' });
     }
 
-    const start = new Date(fromDate);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(toDate);
-    end.setHours(0, 0, 0, 0);
-
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const start = getISTMidnight(fromDate);
+    const end = getISTEndOfDay(toDate);
+    const todayStart = getISTMidnight(new Date());
 
     // 1. Get archived totals for the range
     let usages = await DailyUsage.find({
@@ -1526,8 +1635,7 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
     const liveKvahToday = await calculateTodayKvaConsumption(deviceId);
 
     // Let's get today's stats to update live month's max and avg PF
-    const todayStart = new Date();
-    todayStart.setHours(0,0,0,0);
+    const todayStart = getISTMidnight(new Date());
     const todayStats = await MeterData.aggregate([
       { $match: { deviceId, timestamp: { $gte: todayStart } } },
       { $group: {
@@ -1549,7 +1657,7 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
       if (todayMaxKW > currentMonthEntry.maxKW) currentMonthEntry.maxKW = todayMaxKW;
       
       // Recompute simple average PF for current month:
-      const startOfMonth = new Date(currentYear, now.getMonth(), 1);
+      const startOfMonth = getISTStartOfMonth(now);
       const thisMonthDailies = await DailyUsage.find({ deviceId, date: { $gte: startOfMonth, $lt: todayStart } }).lean();
       const totalPF = thisMonthDailies.reduce((sum, u) => sum + (u.avgPF || 0), 0) + todayAvgPF;
       const countPF = thisMonthDailies.length + 1;

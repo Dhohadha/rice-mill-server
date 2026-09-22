@@ -41,7 +41,7 @@ async function sendMail({ to, subject, html, attachments }) {
 }
 
 /**
- * Main function: Generates reports and emails them to user
+ * Main function: Generates Excel reports with embedded graphs and emails them to user
  */
 async function processDailyEmailExport(userEmail, date, forceSend = false) {
   const settings = await UserSettings.findOne({ userEmail });
@@ -67,7 +67,7 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
     : ['RICE_MILL_001', 'APFC_001', 'EMS_002'];
 
   const dateStr = date.toISOString().split('T')[0];
-  console.log(`📊 Generating Collective Multi-Device PDF & Excel report for ${userEmail} (${deviceIds.length} devices) on ${dateStr}...`);
+  console.log(`📊 Generating Collective Multi-Device Excel report with visual graphs for ${userEmail} (${deviceIds.length} devices) on ${dateStr}...`);
 
   // Gather daily summaries
   const deviceSummaries = [];
@@ -83,9 +83,7 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
     });
   }
 
-  // Generate Graph, PDF and Excel buffers
-  const chartBuffer = await reportService.generateMultiDeviceGraph(deviceIds, date);
-  const pdfBuffer = await reportService.generateMultiDevicePDFReport(deviceSummaries, dateStr, chartBuffer);
+  // Generate Excel buffer with embedded charts plotted from raw logs
   const excelBuffer = await reportService.generateMultiDeviceExcelData(deviceIds, date);
 
   // Save reports locally in exports directory
@@ -112,9 +110,7 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
     }
   };
 
-  const pdfPath = path.join(exportDir, `Collective_Energy_Report_${dateStr}.pdf`);
   const excelPath = path.join(exportDir, `Collective_Meter_Data_${dateStr}.xlsx`);
-  safeWriteFile(pdfPath, pdfBuffer);
   safeWriteFile(excelPath, excelBuffer);
 
   // Prepare HTML Email Body
@@ -154,7 +150,7 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
 
         <p style="font-size: 14px; line-height: 1.5; color: #334155;">Hello,</p>
         <p style="font-size: 14px; line-height: 1.5; color: #334155;">
-          Here is your automated daily energy report. Below is a high-level summary of your energy usage across all monitoring nodes. Detailed PDF reports (with load curves) and raw logs (Excel spreadsheet) are attached to this email.
+          Here is your automated daily energy report. Below is a high-level summary of energy metrics across all monitoring nodes. The attached Excel spreadsheet contains full visual graphs (24-hour active power load curves, apparent power demand, power factor stability curves), hourly breakdown tables, and complete raw data logs.
         </p>
         
         <h4 style="margin: 20px 0 10px 0; color: #0f172a; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">Collective Plant Totals</h4>
@@ -199,7 +195,7 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
         </table>
 
         <p style="font-size: 13px; line-height: 1.5; color: #64748b; margin-bottom: 25px;">
-          For granular hourly data, load curve graphics, and raw logs, please review the attached PDF and Excel files.
+          📊 <b>Visual graphs, hourly breakdown, and raw logs</b> are embedded in the attached Excel spreadsheet (<code>Collective_Meter_Data_${dateStr}.xlsx</code>).
         </p>
 
         <div style="font-size: 11px; text-align: center; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 25px; line-height: 1.4;">
@@ -212,17 +208,12 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
     </html>
   `;
 
-  // Send Email with Attachments
+  // Send Email with Attachments (Only Excel Workbook with Visual Graphs)
   const emailResult = await sendMail({
     to: targetEmail,
-    subject: `📋 Rice Mill Daily Energy Report [${dateStr}]`,
+    subject: `📊 Rice Mill Daily Energy Report [${dateStr}]`,
     html: htmlEmail,
     attachments: [
-      {
-        filename: `Collective_Energy_Report_${dateStr}.pdf`,
-        content: pdfBuffer,
-        contentType: 'application/pdf'
-      },
       {
         filename: `Collective_Meter_Data_${dateStr}.xlsx`,
         content: excelBuffer,
@@ -237,7 +228,8 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
       date: dateStr,
       deviceCount: deviceIds.length,
       recipient: targetEmail,
-      message: `Daily report for ${deviceIds.length} devices successfully emailed to ${targetEmail}!`
+      localExcelPath: excelPath,
+      message: `Daily Excel report with embedded graphs for ${deviceIds.length} devices successfully emailed to ${targetEmail}!`
     };
   } else {
     // Return local fallback info if SMTP not configured
@@ -246,9 +238,8 @@ async function processDailyEmailExport(userEmail, date, forceSend = false) {
       demoMode: true,
       date: dateStr,
       deviceCount: deviceIds.length,
-      localPdfPath: pdfPath,
       localExcelPath: excelPath,
-      message: `Daily report generated locally! (SMTP note: ${emailResult.reason}. Saved in server/exports/).`
+      message: `Daily Excel report with graphs generated locally! (SMTP note: ${emailResult.reason}. Saved in server/exports/).`
     };
   }
 }

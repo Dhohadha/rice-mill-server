@@ -375,7 +375,6 @@ mqttClient.on('message', async (topic, message) => {
 
       // Process Capacitor Statuses (S1 through S12)
       const capacitorKeys = ['S1','S2','S3','S4','S5','S6','S7','S8','S9','S10','S11','S12'];
-      const incomingTimestamp = payload.Timestamp ? new Date(payload.Timestamp) : new Date();
       const hasCapacitorsInPayload = capacitorKeys.some(k => payload[k] !== undefined);
       let currentCapacitorStatesMap = {};
 
